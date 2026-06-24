@@ -1,0 +1,44 @@
+# The custom external scaler itself (built by CI -> ghcr). KEDA dials it over gRPC.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference-scaler
+  namespace: inference
+  labels:
+    app: inference-scaler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: inference-scaler
+  template:
+    metadata:
+      labels:
+        app: inference-scaler
+    spec:
+      containers:
+        - name: scaler
+          image: ghcr.io/kornsour/keda-inference-scaler:latest   # produced by .github/workflows/ci.yml
+          ports:
+            - name: grpc
+              containerPort: 6000
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inference-scaler
+  namespace: inference
+spec:
+  selector:
+    app: inference-scaler
+  ports:
+    - name: grpc
+      port: 6000
+      targetPort: 6000

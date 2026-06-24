@@ -1,0 +1,21 @@
+# Example: scale an LLM serving Deployment via this external scaler.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: vllm-inference
+  namespace: inference
+spec:
+  scaleTargetRef:
+    name: vllm                       # your vLLM Deployment
+  minReplicaCount: 1
+  maxReplicaCount: 4
+  pollingInterval: 15
+  cooldownPeriod: 60
+  triggers:
+    - type: external
+      metadata:
+        scalerAddress: inference-scaler.inference.svc:6000
+        prometheusAddress: http://prometheus.monitoring.svc:9090   # your Prometheus base URL
+        queueThreshold: "3"
+        kvCacheThreshold: "0.7"
+        activationThreshold: "1"
