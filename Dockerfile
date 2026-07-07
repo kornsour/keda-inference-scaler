@@ -1,5 +1,5 @@
 # Multi-stage: generate gRPC stubs from the proto, then build a static binary.
-FROM golang:1.24-bookworm AS build
+FROM golang:1.26-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
