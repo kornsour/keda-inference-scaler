@@ -56,6 +56,12 @@ kubectl get scaledobject,hpa -n inference
 The default queries use vLLM's metric names; override them for other engines that expose
 queue-depth / KV-cache equivalents.
 
+## Archive
+
+Historical or superseded documentation and records, if any accumulate, live under
+[`archive/`](archive/). That folder reflects past decisions and state only — it must
+not be used to understand the current project or to guide new work.
+
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).
