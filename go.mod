@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/prometheus/client_golang v1.24.1
+	golang.org/x/sync v0.22.0
 	google.golang.org/grpc v1.82.1
 	google.golang.org/protobuf v1.36.11
 )

@@ -34,6 +34,7 @@ import (
 	"github.com/kornsour/keda-inference-scaler/internal/saturation"
 
 	pb "github.com/kornsour/keda-inference-scaler/externalscaler"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 )
 
@@ -41,7 +42,7 @@ const metricName = "inference-saturation"
 
 type scaler struct {
 	pb.UnimplementedExternalScalerServer
-	source metrics.Source
+	cache *metrics.CachingSource
 
 	// metrics and health are the scaler's self-observability instruments.
 	// Both are nil-safe: a scaler built as a bare struct literal (as the
@@ -50,16 +51,32 @@ type scaler struct {
 	health  *observability.Health
 }
 
-// queryInstant runs one instant query, recording it as dimension (e.g.
-// "queue" or "kv") in s.metrics and, on a success, marking s.health ready.
+// newScaler wraps source in a CachingSource shared across every ScaledObject
+// this scaler serves, so its TTL cache and singleflight collapsing work
+// across ScaledObjects, not just within one. Callers that want the
+// self-observability instruments wired up (main does; tests generally
+// don't need to) set s.metrics/s.health on the result -- both are nil-safe.
+func newScaler(source metrics.Source) *scaler {
+	return &scaler{cache: metrics.NewCachingSource(source)}
+}
+
+// queryInstant runs one instant query for dimension (e.g. "queue" or "kv")
+// through s.cache -- honoring ttl and collapsing concurrent identical
+// queries via singleflight -- and records it in s.metrics/s.health.
+//
+// Duration and error/readiness bookkeeping reflect what the caller
+// experienced, including a near-zero duration on a cache hit or a
+// singleflight-shared result: that's still a real instant query from the
+// ScaledObject's point of view, it just didn't need its own round trip to
+// Prometheus this time.
 //
 // A well-formed empty result (metrics.ErrMissing) still counts as Prometheus
 // having answered for readiness purposes -- it just also counts as a query
 // error, since it's the case operators most want visibility into (a dropped
 // PodMonitor looks exactly like an idle system otherwise).
-func (s *scaler) queryInstant(ctx context.Context, dimension, addr, query string) (float64, error) {
+func (s *scaler) queryInstant(ctx context.Context, dimension, addr, query string, ttl time.Duration) (float64, error) {
 	start := time.Now()
-	v, err := s.source.Instant(ctx, addr, query)
+	v, err := s.cache.Get(ctx, addr, query, ttl)
 	s.metrics.ObserveQueryDuration(dimension, time.Since(start))
 	switch {
 	case err == nil:
@@ -73,8 +90,14 @@ func (s *scaler) queryInstant(ctx context.Context, dimension, addr, query string
 	return v, err
 }
 
-// saturationFor resolves c's queue and KV-cache readings from s.source and
-// combines them into the composite saturation score.
+// saturationFor resolves c's queue and KV-cache readings and combines them
+// into the composite saturation score.
+//
+// The two queries run concurrently (errgroup.WithContext): total latency is
+// max(queue, kv) rather than queue+kv, and a hard failure in either cancels
+// the other. Both go through s.cache, so repeated calls within c.CacheTTL are
+// served from cache rather than re-querying Prometheus, and concurrent
+// identical queries collapse into one upstream request.
 //
 // A query whose series is absent from the metric backend (metrics.ErrMissing)
 // reads as 0 by default — the same as an idle metric — unless
@@ -83,21 +106,33 @@ func (s *scaler) queryInstant(ctx context.Context, dimension, addr, query string
 // otherwise indistinguishable: a dropped PodMonitor or a relabel change looks
 // exactly like no traffic.
 func (s *scaler) saturationFor(ctx context.Context, c config.Config) (float64, error) {
-	queue, err := s.queryInstant(ctx, "queue", c.PromAddr, c.QueueQuery)
-	if err != nil {
-		if errors.Is(err, metrics.ErrMissing) && !c.TreatMissingAsError {
-			queue = 0
-		} else {
-			return 0, fmt.Errorf("queue query: %w", err)
+	g, gctx := errgroup.WithContext(ctx)
+
+	var queue, kv float64
+	g.Go(func() error {
+		v, err := s.queryInstant(gctx, "queue", c.PromAddr, c.QueueQuery, c.CacheTTL)
+		if err != nil {
+			if errors.Is(err, metrics.ErrMissing) && !c.TreatMissingAsError {
+				return nil
+			}
+			return fmt.Errorf("queue query: %w", err)
 		}
-	}
-	kv, err := s.queryInstant(ctx, "kv", c.PromAddr, c.KVQuery)
-	if err != nil {
-		if errors.Is(err, metrics.ErrMissing) && !c.TreatMissingAsError {
-			kv = 0
-		} else {
-			return 0, fmt.Errorf("kv-cache query: %w", err)
+		queue = v
+		return nil
+	})
+	g.Go(func() error {
+		v, err := s.queryInstant(gctx, "kv", c.PromAddr, c.KVQuery, c.CacheTTL)
+		if err != nil {
+			if errors.Is(err, metrics.ErrMissing) && !c.TreatMissingAsError {
+				return nil
+			}
+			return fmt.Errorf("kv-cache query: %w", err)
 		}
+		kv = v
+		return nil
+	})
+	if err := g.Wait(); err != nil {
+		return 0, err
 	}
 	return saturation.Score(queue, c.QueueThreshold, kv, c.KVThreshold), nil
 }
@@ -120,13 +155,17 @@ func (s *scaler) IsActive(ctx context.Context, ref *pb.ScaledObjectRef) (*pb.IsA
 	return &pb.IsActiveResponse{Result: active}, nil
 }
 
-// streamIsActiveInterval is the StreamIsActive poll period; overridden in
-// tests so the stream doesn't have to run in real time.
-var streamIsActiveInterval = 10 * time.Second
-
+// StreamIsActive polls IsActive on a per-ScaledObject ticker (its interval
+// set by c.StreamPollInterval, configurable via the streamPollInterval
+// scaler-metadata key rather than a single hardcoded value shared by every
+// ScaledObject) and pushes each result on the stream.
 func (s *scaler) StreamIsActive(ref *pb.ScaledObjectRef, stream pb.ExternalScaler_StreamIsActiveServer) error {
 	s.metrics.IncGRPCRequest("StreamIsActive")
-	t := time.NewTicker(streamIsActiveInterval)
+	c, err := config.Parse(ref.ScalerMetadata)
+	if err != nil {
+		return err
+	}
+	t := time.NewTicker(c.StreamPollInterval)
 	defer t.Stop()
 	for {
 		select {
@@ -220,7 +259,10 @@ func main() {
 
 	srv := grpc.NewServer()
 	source := &metrics.Prometheus{HTTP: &http.Client{Timeout: 5 * time.Second}}
-	pb.RegisterExternalScalerServer(srv, &scaler{source: source, metrics: obsMetrics, health: health})
+	s := newScaler(source)
+	s.metrics = obsMetrics
+	s.health = health
+	pb.RegisterExternalScalerServer(srv, s)
 	slog.Info("keda-inference-scaler listening", "addr", addr)
 	if err := srv.Serve(lis); err != nil {
 		slog.Error("serve", "error", err)
