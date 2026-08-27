@@ -31,6 +31,9 @@ func TestParseAppliesDefaults(t *testing.T) {
 	if c.Activation != defaultActivation {
 		t.Errorf("Activation = %v, want default %v", c.Activation, defaultActivation)
 	}
+	if c.CacheTTL != defaultCacheTTL {
+		t.Errorf("CacheTTL = %v, want default %v", c.CacheTTL, defaultCacheTTL)
+	}
 	if c.StreamPollInterval != defaultStreamPollInterval {
 		t.Errorf("StreamPollInterval = %v, want default %v", c.StreamPollInterval, defaultStreamPollInterval)
 	}
@@ -47,6 +50,8 @@ func TestParseOverridesFromMetadata(t *testing.T) {
 		"queueThreshold":      "5",
 		"kvCacheThreshold":    "0.9",
 		"activationThreshold": "2",
+		"cacheTTL":            "5s",
+		"streamPollInterval":  "20s",
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -65,6 +70,29 @@ func TestParseOverridesFromMetadata(t *testing.T) {
 	}
 	if c.Activation != 2 {
 		t.Errorf("Activation = %v, want 2", c.Activation)
+	}
+	if c.CacheTTL != 5*time.Second {
+		t.Errorf("CacheTTL = %v, want 5s", c.CacheTTL)
+	}
+	if c.StreamPollInterval != 20*time.Second {
+		t.Errorf("StreamPollInterval = %v, want 20s", c.StreamPollInterval)
+	}
+}
+
+func TestParseIgnoresUnparsableDuration(t *testing.T) {
+	c, err := Parse(map[string]string{
+		"prometheusAddress":  "http://p:9090",
+		"cacheTTL":           "not-a-duration",
+		"streamPollInterval": "also-not-a-duration",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.CacheTTL != defaultCacheTTL {
+		t.Errorf("CacheTTL = %v, want default %v on unparsable input", c.CacheTTL, defaultCacheTTL)
+	}
+	if c.StreamPollInterval != defaultStreamPollInterval {
+		t.Errorf("StreamPollInterval = %v, want default %v on unparsable input", c.StreamPollInterval, defaultStreamPollInterval)
 	}
 }
 
@@ -91,7 +119,7 @@ func TestParseTreatMissingAsErrorTrue(t *testing.T) {
 func TestParseStreamOptionsFromMetadata(t *testing.T) {
 	c, err := Parse(map[string]string{
 		"prometheusAddress":            "http://p:9090",
-		"streamPollIntervalSeconds":    "0.25",
+		"streamPollInterval":           "250ms",
 		"streamMaxConsecutiveFailures": "3",
 	})
 	if err != nil {
@@ -108,7 +136,7 @@ func TestParseStreamOptionsFromMetadata(t *testing.T) {
 func TestParseStreamOptionsRejectNonPositiveValues(t *testing.T) {
 	c, err := Parse(map[string]string{
 		"prometheusAddress":            "http://p:9090",
-		"streamPollIntervalSeconds":    "0",
+		"streamPollInterval":           "0s",
 		"streamMaxConsecutiveFailures": "-1",
 	})
 	if err != nil {

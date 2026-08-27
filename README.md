@@ -100,11 +100,27 @@ Logging is structured (`log/slog`, JSON-free key/value text by default) with `na
 | `kvCacheThreshold` | `0.7` | KV-cache fraction that counts as "at threshold" |
 | `activationThreshold` | `1` | saturation below which the target may scale to zero |
 | `treatMissingAsError` | `false` | see below |
-| `streamPollIntervalSeconds` | `10` | how often `StreamIsActive` polls while queries are succeeding; independent of the ScaledObject's own `pollingInterval`, which governs the `IsActive`/`GetMetrics` fallback path |
+| `cacheTTL` | `15s` | how long a Prometheus reading is reused before re-querying; Go duration syntax (e.g. `10s`, `1m`). `0` disables caching |
+| `streamPollInterval` | `10s` | how often `StreamIsActive` polls while queries are succeeding; Go duration syntax; independent of the ScaledObject's own `pollingInterval`, which governs the `IsActive`/`GetMetrics` fallback path |
 | `streamMaxConsecutiveFailures` | `5` | consecutive `StreamIsActive` query failures tolerated before the stream gives up and returns an error, letting KEDA re-establish it |
 
 The default queries use vLLM's metric names; override them for other engines that expose
 queue-depth / KV-cache equivalents.
+
+### Query concurrency and caching
+
+The queue and KV-cache queries run concurrently, so one call to `IsActive`/`GetMetrics` costs
+`max(queue latency, kv latency)` against Prometheus rather than the sum, and a hard failure in
+either query cancels the other instead of waiting it out.
+
+Both queries also go through a process-wide cache keyed by `(prometheusAddress, query)`, shared
+across every ScaledObject this scaler serves. A reading younger than `cacheTTL` is served from
+cache instead of re-querying; concurrent identical queries (multiple ScaledObjects sharing a
+Prometheus and a query, or `GetMetrics`/`IsActive`/`StreamIsActive` all polling the same
+ScaledObject around the same time) collapse into a single upstream request via
+[`singleflight`](https://pkg.go.dev/golang.org/x/sync/singleflight). Set `cacheTTL` at or below
+your Prometheus scrape interval — querying faster than Prometheus scrapes just re-reads the same
+sample at full network cost.
 
 ### Absent metric vs. idle system
 

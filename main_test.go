@@ -38,11 +38,95 @@ func (f *fakeSource) Instant(_ context.Context, _, query string) (float64, error
 	return f.values[query], nil
 }
 
+// slowSource is a metrics.Source whose Instant sleeps delay[query] before
+// returning values[query], letting a test measure whether two queries ran
+// concurrently (elapsed ~= max(delays)) or sequentially (elapsed ~= sum).
+type slowSource struct {
+	values map[string]float64
+	delay  map[string]time.Duration
+}
+
+func (s *slowSource) Instant(_ context.Context, _, query string) (float64, error) {
+	time.Sleep(s.delay[query])
+	return s.values[query], nil
+}
+
+func TestSaturationForQueriesConcurrently(t *testing.T) {
+	const perQueryDelay = 100 * time.Millisecond
+	s := newScaler(&slowSource{
+		values: map[string]float64{"queue_q": 1, "kv_q": 1},
+		delay:  map[string]time.Duration{"queue_q": perQueryDelay, "kv_q": perQueryDelay},
+	})
+	c := config.Config{
+		PromAddr: "unused", QueueQuery: "queue_q", KVQuery: "kv_q",
+		QueueThreshold: 1, KVThreshold: 1,
+	}
+
+	start := time.Now()
+	if _, err := s.saturationFor(context.Background(), c); err != nil {
+		t.Fatalf("saturationFor: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	// Sequential would take ~2*perQueryDelay; concurrent should stay well
+	// under that -- give it a generous margin (1.5x one delay) to avoid
+	// flaking on a loaded CI box.
+	if elapsed >= perQueryDelay*3/2 {
+		t.Fatalf("saturationFor took %v, expected close to the %v of one query (queries should run concurrently, not sequentially)", elapsed, perQueryDelay)
+	}
+}
+
+// cancelWatchingSource is a metrics.Source whose Instant blocks on the given
+// query until either release is closed (normal return) or ctx is cancelled
+// (returns ctx.Err()), and records which happened first.
+type cancelWatchingSource struct {
+	watchQuery string
+	release    chan struct{}
+	sawCancel  chan struct{} // closed if ctx.Done() fired for watchQuery
+}
+
+func (c *cancelWatchingSource) Instant(ctx context.Context, _, query string) (float64, error) {
+	if query != c.watchQuery {
+		return 0, errors.New("boom")
+	}
+	select {
+	case <-c.release:
+		return 1, nil
+	case <-ctx.Done():
+		close(c.sawCancel)
+		return 0, ctx.Err()
+	}
+}
+
+func TestSaturationForCancelsOtherQueryOnFailure(t *testing.T) {
+	src := &cancelWatchingSource{
+		watchQuery: "queue_q",
+		release:    make(chan struct{}),
+		sawCancel:  make(chan struct{}),
+	}
+	s := newScaler(src)
+	c := config.Config{
+		PromAddr: "unused", QueueQuery: "queue_q", KVQuery: "kv_q",
+		QueueThreshold: 1, KVThreshold: 1,
+	}
+	defer close(src.release) // avoid leaking the goroutine if the assertion fails
+
+	if _, err := s.saturationFor(context.Background(), c); err == nil {
+		t.Fatal("expected an error from the failing kv-cache query")
+	}
+
+	select {
+	case <-src.sawCancel:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected the queue query's context to be cancelled once the kv-cache query failed")
+	}
+}
+
 func TestScalerSaturationForUsesConfiguredQueries(t *testing.T) {
-	s := &scaler{source: &fakeSource{values: map[string]float64{
+	s := newScaler(&fakeSource{values: map[string]float64{
 		"queue_q": 6,
 		"kv_q":    0.35,
-	}}}
+	}})
 	c := config.Config{
 		PromAddr:       "unused",
 		QueueQuery:     "queue_q",
@@ -62,7 +146,7 @@ func TestScalerSaturationForUsesConfiguredQueries(t *testing.T) {
 }
 
 func TestMissingSeriesReadsAsIdleByDefault(t *testing.T) {
-	s := &scaler{source: &fakeSource{missing: map[string]bool{"queue_q": true, "kv_q": true}}}
+	s := newScaler(&fakeSource{missing: map[string]bool{"queue_q": true, "kv_q": true}})
 	c := config.Config{PromAddr: "unused", QueueQuery: "queue_q", KVQuery: "kv_q", QueueThreshold: 3, KVThreshold: 0.7}
 
 	got, err := s.saturationFor(context.Background(), c)
@@ -75,7 +159,7 @@ func TestMissingSeriesReadsAsIdleByDefault(t *testing.T) {
 }
 
 func TestMissingSeriesErrorsWhenConfigured(t *testing.T) {
-	s := &scaler{source: &fakeSource{missing: map[string]bool{"queue_q": true, "kv_q": true}}}
+	s := newScaler(&fakeSource{missing: map[string]bool{"queue_q": true, "kv_q": true}})
 	c := config.Config{PromAddr: "unused", QueueQuery: "queue_q", KVQuery: "kv_q", QueueThreshold: 3, KVThreshold: 0.7, TreatMissingAsError: true}
 
 	if _, err := s.saturationFor(context.Background(), c); err == nil {
@@ -85,7 +169,7 @@ func TestMissingSeriesErrorsWhenConfigured(t *testing.T) {
 
 func TestIsActive(t *testing.T) {
 	t.Run("below activation threshold", func(t *testing.T) {
-		s := &scaler{source: &fakeSource{values: map[string]float64{"queue_q": 0, "kv_q": 0}}}
+		s := newScaler(&fakeSource{values: map[string]float64{"queue_q": 0, "kv_q": 0}})
 		ref := &pb.ScaledObjectRef{
 			Namespace: "ns",
 			Name:      "obj",
@@ -108,7 +192,7 @@ func TestIsActive(t *testing.T) {
 	t.Run("above activation threshold", func(t *testing.T) {
 		// queue=6, threshold=3 -> saturation 200, well above the default
 		// activation threshold of 1.
-		s := &scaler{source: &fakeSource{values: map[string]float64{"queue_q": 6, "kv_q": 0}}}
+		s := newScaler(&fakeSource{values: map[string]float64{"queue_q": 6, "kv_q": 0}})
 		ref := &pb.ScaledObjectRef{
 			Namespace: "ns",
 			Name:      "obj",
@@ -135,7 +219,7 @@ func TestIsActive(t *testing.T) {
 	})
 
 	t.Run("query error propagates", func(t *testing.T) {
-		s := &scaler{source: &fakeSource{errs: map[string]error{"queue_q": errors.New("boom")}}}
+		s := newScaler(&fakeSource{errs: map[string]error{"queue_q": errors.New("boom")}})
 		ref := &pb.ScaledObjectRef{ScalerMetadata: map[string]string{
 			"prometheusAddress": "unused",
 			"queueQuery":        "queue_q",
@@ -172,10 +256,10 @@ func TestGetMetrics(t *testing.T) {
 	// queue=2.72, threshold=3 -> qScore=0.90666..., saturation=90.666...
 	// (kv is 0, so it never dominates). math.Round should push the integer
 	// MetricValue to 91 while the float field keeps the unrounded value.
-	s := &scaler{source: &fakeSource{values: map[string]float64{
+	s := newScaler(&fakeSource{values: map[string]float64{
 		"queue_q": 2.72,
 		"kv_q":    0,
-	}}}
+	}})
 	req := &pb.GetMetricsRequest{
 		ScaledObjectRef: &pb.ScaledObjectRef{
 			Namespace: "ns",
@@ -215,7 +299,7 @@ func TestGetMetrics(t *testing.T) {
 	})
 
 	t.Run("query error propagates", func(t *testing.T) {
-		s := &scaler{source: &fakeSource{errs: map[string]error{"queue_q": errors.New("boom")}}}
+		s := newScaler(&fakeSource{errs: map[string]error{"queue_q": errors.New("boom")}})
 		req := &pb.GetMetricsRequest{ScaledObjectRef: &pb.ScaledObjectRef{ScalerMetadata: map[string]string{
 			"prometheusAddress": "unused",
 			"queueQuery":        "queue_q",
@@ -250,12 +334,12 @@ func (f *fakeStreamServer) SendMsg(m any) error          { return nil }
 func (f *fakeStreamServer) RecvMsg(m any) error          { return nil }
 
 func TestStreamIsActiveSendsOnEachTick(t *testing.T) {
-	s := &scaler{source: &fakeSource{values: map[string]float64{"queue_q": 6, "kv_q": 0}}} // saturation 200, active
+	s := newScaler(&fakeSource{values: map[string]float64{"queue_q": 6, "kv_q": 0}}) // saturation 200, active
 	ref := &pb.ScaledObjectRef{ScalerMetadata: map[string]string{
-		"prometheusAddress":         "unused",
-		"queueQuery":                "queue_q",
-		"kvCacheQuery":              "kv_q",
-		"streamPollIntervalSeconds": "0.005",
+		"prometheusAddress":  "unused",
+		"queueQuery":         "queue_q",
+		"kvCacheQuery":       "kv_q",
+		"streamPollInterval": "5ms",
 	}}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -284,12 +368,21 @@ func TestStreamIsActiveSendsOnEachTick(t *testing.T) {
 	}
 }
 
+func TestStreamIsActiveInvalidConfig(t *testing.T) {
+	s := &scaler{}
+	ref := &pb.ScaledObjectRef{ScalerMetadata: map[string]string{}}
+	fs := &fakeStreamServer{ctx: context.Background(), sent: make(chan *pb.IsActiveResponse, 1)}
+	if err := s.StreamIsActive(ref, fs); err == nil {
+		t.Fatal("expected error when prometheusAddress is missing")
+	}
+}
+
 func TestStreamIsActiveReturnsImmediatelyWhenContextDone(t *testing.T) {
 	s := &scaler{}
-	// A poll interval long enough that only ctx.Done() can end the test.
+	// streamPollInterval long enough that only ctx.Done() can end the test.
 	ref := &pb.ScaledObjectRef{ScalerMetadata: map[string]string{
-		"prometheusAddress":         "unused",
-		"streamPollIntervalSeconds": "3600",
+		"prometheusAddress":  "unused",
+		"streamPollInterval": "1h",
 	}}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -310,12 +403,12 @@ func TestStreamIsActiveReturnsImmediatelyWhenContextDone(t *testing.T) {
 }
 
 func TestStreamIsActiveSkipsSendOnTransientQueryError(t *testing.T) {
-	s := &scaler{source: &fakeSource{errs: map[string]error{"queue_q": errors.New("boom")}}}
+	s := newScaler(&fakeSource{errs: map[string]error{"queue_q": errors.New("boom")}})
 	ref := &pb.ScaledObjectRef{ScalerMetadata: map[string]string{
 		"prometheusAddress":            "unused",
 		"queueQuery":                   "queue_q",
 		"kvCacheQuery":                 "kv_q",
-		"streamPollIntervalSeconds":    "0.005",
+		"streamPollInterval":           "5ms",
 		"streamMaxConsecutiveFailures": "100", // high enough that this test's failures don't exhaust it
 	}}
 
@@ -348,7 +441,8 @@ func TestStreamIsActiveSkipsSendOnTransientQueryError(t *testing.T) {
 
 func TestStreamIsActiveEndsStreamAfterMaxConsecutiveFailures(t *testing.T) {
 	m := observability.NewMetrics()
-	s := &scaler{source: &fakeSource{errs: map[string]error{"queue_q": errors.New("boom")}}, metrics: m}
+	s := newScaler(&fakeSource{errs: map[string]error{"queue_q": errors.New("boom")}})
+	s.metrics = m
 	ref := &pb.ScaledObjectRef{
 		Namespace: "ns",
 		Name:      "obj",
@@ -356,7 +450,7 @@ func TestStreamIsActiveEndsStreamAfterMaxConsecutiveFailures(t *testing.T) {
 			"prometheusAddress":            "unused",
 			"queueQuery":                   "queue_q",
 			"kvCacheQuery":                 "kv_q",
-			"streamPollIntervalSeconds":    "0.002",
+			"streamPollInterval":           "2ms",
 			"streamMaxConsecutiveFailures": "3",
 		},
 	}
@@ -383,14 +477,14 @@ func TestStreamIsActiveEndsStreamAfterMaxConsecutiveFailures(t *testing.T) {
 }
 
 func TestStreamIsActiveBacksOffBetweenFailures(t *testing.T) {
-	s := &scaler{source: &fakeSource{errs: map[string]error{"queue_q": errors.New("boom")}}}
+	s := newScaler(&fakeSource{errs: map[string]error{"queue_q": errors.New("boom")}})
 	interval := 2 * time.Millisecond
 	maxFailures := 5
 	ref := &pb.ScaledObjectRef{ScalerMetadata: map[string]string{
 		"prometheusAddress":            "unused",
 		"queueQuery":                   "queue_q",
 		"kvCacheQuery":                 "kv_q",
-		"streamPollIntervalSeconds":    "0.002",
+		"streamPollInterval":           "2ms",
 		"streamMaxConsecutiveFailures": "5",
 	}}
 
@@ -423,27 +517,30 @@ func TestStreamIsActiveBacksOffBetweenFailures(t *testing.T) {
 }
 
 func TestStreamIsActiveResetsFailureCountOnSuccess(t *testing.T) {
-	// Fails on the first call, then always succeeds -- if the failure count
+	// Fails on the first tick, then always succeeds -- if the failure count
 	// weren't reset after a success, unrelated later failures in a long-lived
 	// stream could accumulate toward the limit even with successes in
-	// between. Here there's only one failure total, so the stream must not
-	// give up.
-	calls := 0
+	// between. Here there's only one failed tick total, so the stream must
+	// not give up. saturationFor queries queue and kv concurrently, so the
+	// first tick issues two Instant calls (order unspecified between them);
+	// both fail to guarantee that tick's IsActive reports an error regardless
+	// of which of the two the errgroup happens to observe first. n comes from
+	// countingSource's own mutex-guarded counter, so this closure stays safe
+	// to call concurrently from both queries without needing its own state.
 	src := &countingSource{
 		fn: func(n int) (float64, error) {
-			calls++
-			if n == 1 {
+			if n <= 2 {
 				return 0, errors.New("boom")
 			}
 			return 0, nil
 		},
 	}
-	s := &scaler{source: src}
+	s := newScaler(src)
 	ref := &pb.ScaledObjectRef{ScalerMetadata: map[string]string{
 		"prometheusAddress":            "unused",
 		"queueQuery":                   "queue_q",
 		"kvCacheQuery":                 "kv_q",
-		"streamPollIntervalSeconds":    "0.002",
+		"streamPollInterval":           "2ms",
 		"streamMaxConsecutiveFailures": "2",
 	}}
 
