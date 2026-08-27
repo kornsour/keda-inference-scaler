@@ -1,0 +1,46 @@
+# The "fake vLLM metrics endpoint" from issue #9: a Prometheus-API-compatible
+# stub (test/e2e/fakeprom) standing in for a real Prometheus scraping a real
+# vLLM. Built and loaded into the kind cluster by test/e2e/run.sh.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fake-vllm-metrics
+  namespace: inference
+  labels:
+    app: fake-vllm-metrics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fake-vllm-metrics
+  template:
+    metadata:
+      labels:
+        app: fake-vllm-metrics
+    spec:
+      containers:
+        - name: fakeprom
+          image: keda-inference-scaler-fakeprom:e2e
+          imagePullPolicy: Never # kind-loaded, not pulled from a registry
+          ports:
+            - name: http
+              containerPort: 9090
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9090
+            initialDelaySeconds: 1
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fake-vllm-metrics
+  namespace: inference
+spec:
+  selector:
+    app: fake-vllm-metrics
+  ports:
+    - name: http
+      port: 9090
+      targetPort: 9090

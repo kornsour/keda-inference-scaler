@@ -36,6 +36,27 @@ These work right after a clone with nothing but Go installed — the gRPC stubs 
 `externalscaler/` (generated from `externalscaler.proto`, KEDA's external-scaler contract)
 are checked into the repo, not generated on the fly.
 
+`make test` includes three layers of coverage, in increasing order of what they can catch:
+
+- **Unit tests** (`main_test.go`, `internal/*/**_test.go`) exercise the saturation math and
+  config parsing directly against a fake Prometheus — no gRPC involved.
+- **gRPC contract test** (`grpc_contract_test.go`) starts the real server on a loopback
+  listener, dials it with a real `grpc-go` client, and drives all four `ExternalScaler` RPCs
+  (`IsActive`, `StreamIsActive`, `GetMetricSpec`, `GetMetrics`) over the wire. This is what
+  catches a registration mistake or a proto-shape regression that a same-process unit test
+  can't see, and it runs in CI on every push (see `.github/workflows/ci.yml`).
+- **KEDA end-to-end smoke** (`test/e2e/`) is the heavier, "worth it once" check from
+  [issue #9](https://github.com/kornsour/keda-inference-scaler/issues/9): it spins up a
+  local [kind](https://kind.sigs.k8s.io) cluster, installs a real KEDA, applies this repo's
+  own `deploy/` manifests against a fake vLLM metrics endpoint, and asserts the resulting HPA
+  actually reports the `inference-saturation` external metric. It's not run on every push —
+  see `.github/workflows/e2e.yml` for when it runs, and `test/e2e/evidence/` for the
+  `kubectl describe hpa` output and scaler logs from the last recorded run.
+
+  ```bash
+  test/e2e/run.sh    # requires kind, kubectl, helm, docker; ~2-4 min
+  ```
+
 ### Regenerating the stubs
 
 Only needed after editing `externalscaler/externalscaler.proto`:
