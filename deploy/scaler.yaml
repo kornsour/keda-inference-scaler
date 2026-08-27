@@ -22,6 +22,27 @@ spec:
           ports:
             - name: grpc
               containerPort: 6000
+            - name: http
+              containerPort: 8080
+          # /healthz is process liveness only (no Prometheus dependency), so
+          # a wedged process gets restarted without the scaler's ability to
+          # reach Prometheus flapping the container.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          # /readyz additionally fails once the configured Prometheus hasn't
+          # answered successfully within the readiness window (READY_WINDOW,
+          # default 2m) -- see internal/observability. That takes the pod out
+          # of the Service (and so out of KEDA's view) without restarting it.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
           resources:
             requests:
               cpu: 25m
@@ -42,3 +63,6 @@ spec:
     - name: grpc
       port: 6000
       targetPort: 6000
+    - name: http
+      port: 8080
+      targetPort: 8080
