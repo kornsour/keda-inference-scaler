@@ -3,14 +3,17 @@ package main
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/kornsour/keda-inference-scaler/internal/config"
 	"github.com/kornsour/keda-inference-scaler/internal/metrics"
+	"github.com/kornsour/keda-inference-scaler/internal/observability"
 	"github.com/kornsour/keda-inference-scaler/internal/saturation"
 
 	pb "github.com/kornsour/keda-inference-scaler/externalscaler"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"google.golang.org/grpc/metadata"
 )
 
@@ -35,11 +38,95 @@ func (f *fakeSource) Instant(_ context.Context, _, query string) (float64, error
 	return f.values[query], nil
 }
 
+// slowSource is a metrics.Source whose Instant sleeps delay[query] before
+// returning values[query], letting a test measure whether two queries ran
+// concurrently (elapsed ~= max(delays)) or sequentially (elapsed ~= sum).
+type slowSource struct {
+	values map[string]float64
+	delay  map[string]time.Duration
+}
+
+func (s *slowSource) Instant(_ context.Context, _, query string) (float64, error) {
+	time.Sleep(s.delay[query])
+	return s.values[query], nil
+}
+
+func TestSaturationForQueriesConcurrently(t *testing.T) {
+	const perQueryDelay = 100 * time.Millisecond
+	s := newScaler(&slowSource{
+		values: map[string]float64{"queue_q": 1, "kv_q": 1},
+		delay:  map[string]time.Duration{"queue_q": perQueryDelay, "kv_q": perQueryDelay},
+	})
+	c := config.Config{
+		PromAddr: "unused", QueueQuery: "queue_q", KVQuery: "kv_q",
+		QueueThreshold: 1, KVThreshold: 1,
+	}
+
+	start := time.Now()
+	if _, err := s.saturationFor(context.Background(), c); err != nil {
+		t.Fatalf("saturationFor: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	// Sequential would take ~2*perQueryDelay; concurrent should stay well
+	// under that -- give it a generous margin (1.5x one delay) to avoid
+	// flaking on a loaded CI box.
+	if elapsed >= perQueryDelay*3/2 {
+		t.Fatalf("saturationFor took %v, expected close to the %v of one query (queries should run concurrently, not sequentially)", elapsed, perQueryDelay)
+	}
+}
+
+// cancelWatchingSource is a metrics.Source whose Instant blocks on the given
+// query until either release is closed (normal return) or ctx is cancelled
+// (returns ctx.Err()), and records which happened first.
+type cancelWatchingSource struct {
+	watchQuery string
+	release    chan struct{}
+	sawCancel  chan struct{} // closed if ctx.Done() fired for watchQuery
+}
+
+func (c *cancelWatchingSource) Instant(ctx context.Context, _, query string) (float64, error) {
+	if query != c.watchQuery {
+		return 0, errors.New("boom")
+	}
+	select {
+	case <-c.release:
+		return 1, nil
+	case <-ctx.Done():
+		close(c.sawCancel)
+		return 0, ctx.Err()
+	}
+}
+
+func TestSaturationForCancelsOtherQueryOnFailure(t *testing.T) {
+	src := &cancelWatchingSource{
+		watchQuery: "queue_q",
+		release:    make(chan struct{}),
+		sawCancel:  make(chan struct{}),
+	}
+	s := newScaler(src)
+	c := config.Config{
+		PromAddr: "unused", QueueQuery: "queue_q", KVQuery: "kv_q",
+		QueueThreshold: 1, KVThreshold: 1,
+	}
+	defer close(src.release) // avoid leaking the goroutine if the assertion fails
+
+	if _, err := s.saturationFor(context.Background(), c); err == nil {
+		t.Fatal("expected an error from the failing kv-cache query")
+	}
+
+	select {
+	case <-src.sawCancel:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected the queue query's context to be cancelled once the kv-cache query failed")
+	}
+}
+
 func TestScalerSaturationForUsesConfiguredQueries(t *testing.T) {
-	s := &scaler{source: &fakeSource{values: map[string]float64{
+	s := newScaler(&fakeSource{values: map[string]float64{
 		"queue_q": 6,
 		"kv_q":    0.35,
-	}}}
+	}})
 	c := config.Config{
 		PromAddr:       "unused",
 		QueueQuery:     "queue_q",
@@ -59,7 +146,7 @@ func TestScalerSaturationForUsesConfiguredQueries(t *testing.T) {
 }
 
 func TestMissingSeriesReadsAsIdleByDefault(t *testing.T) {
-	s := &scaler{source: &fakeSource{missing: map[string]bool{"queue_q": true, "kv_q": true}}}
+	s := newScaler(&fakeSource{missing: map[string]bool{"queue_q": true, "kv_q": true}})
 	c := config.Config{PromAddr: "unused", QueueQuery: "queue_q", KVQuery: "kv_q", QueueThreshold: 3, KVThreshold: 0.7}
 
 	got, err := s.saturationFor(context.Background(), c)
@@ -72,7 +159,7 @@ func TestMissingSeriesReadsAsIdleByDefault(t *testing.T) {
 }
 
 func TestMissingSeriesErrorsWhenConfigured(t *testing.T) {
-	s := &scaler{source: &fakeSource{missing: map[string]bool{"queue_q": true, "kv_q": true}}}
+	s := newScaler(&fakeSource{missing: map[string]bool{"queue_q": true, "kv_q": true}})
 	c := config.Config{PromAddr: "unused", QueueQuery: "queue_q", KVQuery: "kv_q", QueueThreshold: 3, KVThreshold: 0.7, TreatMissingAsError: true}
 
 	if _, err := s.saturationFor(context.Background(), c); err == nil {
@@ -82,7 +169,7 @@ func TestMissingSeriesErrorsWhenConfigured(t *testing.T) {
 
 func TestIsActive(t *testing.T) {
 	t.Run("below activation threshold", func(t *testing.T) {
-		s := &scaler{source: &fakeSource{values: map[string]float64{"queue_q": 0, "kv_q": 0}}}
+		s := newScaler(&fakeSource{values: map[string]float64{"queue_q": 0, "kv_q": 0}})
 		ref := &pb.ScaledObjectRef{
 			Namespace: "ns",
 			Name:      "obj",
@@ -105,7 +192,7 @@ func TestIsActive(t *testing.T) {
 	t.Run("above activation threshold", func(t *testing.T) {
 		// queue=6, threshold=3 -> saturation 200, well above the default
 		// activation threshold of 1.
-		s := &scaler{source: &fakeSource{values: map[string]float64{"queue_q": 6, "kv_q": 0}}}
+		s := newScaler(&fakeSource{values: map[string]float64{"queue_q": 6, "kv_q": 0}})
 		ref := &pb.ScaledObjectRef{
 			Namespace: "ns",
 			Name:      "obj",
@@ -132,7 +219,7 @@ func TestIsActive(t *testing.T) {
 	})
 
 	t.Run("query error propagates", func(t *testing.T) {
-		s := &scaler{source: &fakeSource{errs: map[string]error{"queue_q": errors.New("boom")}}}
+		s := newScaler(&fakeSource{errs: map[string]error{"queue_q": errors.New("boom")}})
 		ref := &pb.ScaledObjectRef{ScalerMetadata: map[string]string{
 			"prometheusAddress": "unused",
 			"queueQuery":        "queue_q",
@@ -169,10 +256,10 @@ func TestGetMetrics(t *testing.T) {
 	// queue=2.72, threshold=3 -> qScore=0.90666..., saturation=90.666...
 	// (kv is 0, so it never dominates). math.Round should push the integer
 	// MetricValue to 91 while the float field keeps the unrounded value.
-	s := &scaler{source: &fakeSource{values: map[string]float64{
+	s := newScaler(&fakeSource{values: map[string]float64{
 		"queue_q": 2.72,
 		"kv_q":    0,
-	}}}
+	}})
 	req := &pb.GetMetricsRequest{
 		ScaledObjectRef: &pb.ScaledObjectRef{
 			Namespace: "ns",
@@ -212,7 +299,7 @@ func TestGetMetrics(t *testing.T) {
 	})
 
 	t.Run("query error propagates", func(t *testing.T) {
-		s := &scaler{source: &fakeSource{errs: map[string]error{"queue_q": errors.New("boom")}}}
+		s := newScaler(&fakeSource{errs: map[string]error{"queue_q": errors.New("boom")}})
 		req := &pb.GetMetricsRequest{ScaledObjectRef: &pb.ScaledObjectRef{ScalerMetadata: map[string]string{
 			"prometheusAddress": "unused",
 			"queueQuery":        "queue_q",
@@ -247,15 +334,12 @@ func (f *fakeStreamServer) SendMsg(m any) error          { return nil }
 func (f *fakeStreamServer) RecvMsg(m any) error          { return nil }
 
 func TestStreamIsActiveSendsOnEachTick(t *testing.T) {
-	orig := streamIsActiveInterval
-	streamIsActiveInterval = 5 * time.Millisecond
-	defer func() { streamIsActiveInterval = orig }()
-
-	s := &scaler{source: &fakeSource{values: map[string]float64{"queue_q": 6, "kv_q": 0}}} // saturation 200, active
+	s := newScaler(&fakeSource{values: map[string]float64{"queue_q": 6, "kv_q": 0}}) // saturation 200, active
 	ref := &pb.ScaledObjectRef{ScalerMetadata: map[string]string{
-		"prometheusAddress": "unused",
-		"queueQuery":        "queue_q",
-		"kvCacheQuery":      "kv_q",
+		"prometheusAddress":  "unused",
+		"queueQuery":         "queue_q",
+		"kvCacheQuery":       "kv_q",
+		"streamPollInterval": "5ms",
 	}}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -284,13 +368,22 @@ func TestStreamIsActiveSendsOnEachTick(t *testing.T) {
 	}
 }
 
-func TestStreamIsActiveReturnsImmediatelyWhenContextDone(t *testing.T) {
-	orig := streamIsActiveInterval
-	streamIsActiveInterval = time.Hour // long enough that only ctx.Done() can end the test
-	defer func() { streamIsActiveInterval = orig }()
-
+func TestStreamIsActiveInvalidConfig(t *testing.T) {
 	s := &scaler{}
-	ref := &pb.ScaledObjectRef{ScalerMetadata: map[string]string{"prometheusAddress": "unused"}}
+	ref := &pb.ScaledObjectRef{ScalerMetadata: map[string]string{}}
+	fs := &fakeStreamServer{ctx: context.Background(), sent: make(chan *pb.IsActiveResponse, 1)}
+	if err := s.StreamIsActive(ref, fs); err == nil {
+		t.Fatal("expected error when prometheusAddress is missing")
+	}
+}
+
+func TestStreamIsActiveReturnsImmediatelyWhenContextDone(t *testing.T) {
+	s := &scaler{}
+	// streamPollInterval long enough that only ctx.Done() can end the test.
+	ref := &pb.ScaledObjectRef{ScalerMetadata: map[string]string{
+		"prometheusAddress":  "unused",
+		"streamPollInterval": "1h",
+	}}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -309,16 +402,14 @@ func TestStreamIsActiveReturnsImmediatelyWhenContextDone(t *testing.T) {
 	}
 }
 
-func TestStreamIsActiveSkipsSendOnQueryError(t *testing.T) {
-	orig := streamIsActiveInterval
-	streamIsActiveInterval = 5 * time.Millisecond
-	defer func() { streamIsActiveInterval = orig }()
-
-	s := &scaler{source: &fakeSource{errs: map[string]error{"queue_q": errors.New("boom")}}}
+func TestStreamIsActiveSkipsSendOnTransientQueryError(t *testing.T) {
+	s := newScaler(&fakeSource{errs: map[string]error{"queue_q": errors.New("boom")}})
 	ref := &pb.ScaledObjectRef{ScalerMetadata: map[string]string{
-		"prometheusAddress": "unused",
-		"queueQuery":        "queue_q",
-		"kvCacheQuery":      "kv_q",
+		"prometheusAddress":            "unused",
+		"queueQuery":                   "queue_q",
+		"kvCacheQuery":                 "kv_q",
+		"streamPollInterval":           "5ms",
+		"streamMaxConsecutiveFailures": "100", // high enough that this test's failures don't exhaust it
 	}}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -327,9 +418,10 @@ func TestStreamIsActiveSkipsSendOnQueryError(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- s.StreamIsActive(ref, fs) }()
 
-	// A failing IsActive should be skipped (no send, no returned error) --
-	// give it a couple of tick intervals to prove nothing arrives, then
-	// cancel and confirm a clean return.
+	// A failing IsActive should be skipped (no send), and the stream kept
+	// open, while consecutive failures stay under the configured limit --
+	// give it a few tick intervals to prove nothing arrives, then cancel and
+	// confirm a clean return.
 	select {
 	case resp := <-fs.sent:
 		t.Fatalf("expected no send on query error, got %+v", resp)
@@ -345,4 +437,164 @@ func TestStreamIsActiveSkipsSendOnQueryError(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for StreamIsActive to return after context cancel")
 	}
+}
+
+func TestStreamIsActiveEndsStreamAfterMaxConsecutiveFailures(t *testing.T) {
+	m := observability.NewMetrics()
+	s := newScaler(&fakeSource{errs: map[string]error{"queue_q": errors.New("boom")}})
+	s.metrics = m
+	ref := &pb.ScaledObjectRef{
+		Namespace: "ns",
+		Name:      "obj",
+		ScalerMetadata: map[string]string{
+			"prometheusAddress":            "unused",
+			"queueQuery":                   "queue_q",
+			"kvCacheQuery":                 "kv_q",
+			"streamPollInterval":           "2ms",
+			"streamMaxConsecutiveFailures": "3",
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fs := &fakeStreamServer{ctx: ctx, sent: make(chan *pb.IsActiveResponse, 1)}
+
+	done := make(chan error, 1)
+	go func() { done <- s.StreamIsActive(ref, fs) }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected StreamIsActive to return an error after repeated query failures")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for StreamIsActive to give up after repeated failures")
+	}
+
+	if got := testutil.ToFloat64(m.StreamErrors); got < 3 {
+		t.Fatalf("StreamErrors = %v, want at least 3", got)
+	}
+}
+
+func TestStreamIsActiveBacksOffBetweenFailures(t *testing.T) {
+	s := newScaler(&fakeSource{errs: map[string]error{"queue_q": errors.New("boom")}})
+	interval := 2 * time.Millisecond
+	maxFailures := 5
+	ref := &pb.ScaledObjectRef{ScalerMetadata: map[string]string{
+		"prometheusAddress":            "unused",
+		"queueQuery":                   "queue_q",
+		"kvCacheQuery":                 "kv_q",
+		"streamPollInterval":           "2ms",
+		"streamMaxConsecutiveFailures": "5",
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fs := &fakeStreamServer{ctx: ctx, sent: make(chan *pb.IsActiveResponse, 1)}
+
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() { done <- s.StreamIsActive(ref, fs) }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected an error once consecutive failures reach the configured max")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for StreamIsActive to give up")
+	}
+	elapsed := time.Since(start)
+
+	// With no backoff, maxFailures failures at a flat `interval` would take
+	// roughly maxFailures*interval. With doubling backoff (interval, 2x, 4x,
+	// ...) it should take noticeably longer -- assert it's well above the
+	// flat-rate figure as a sanity check that backoff is actually happening.
+	flatRate := time.Duration(maxFailures) * interval
+	if elapsed < flatRate*2 {
+		t.Fatalf("elapsed %s did not noticeably exceed flat-rate retry time %s -- backoff may not be applied", elapsed, flatRate)
+	}
+}
+
+func TestStreamIsActiveResetsFailureCountOnSuccess(t *testing.T) {
+	// Fails on the first tick, then always succeeds -- if the failure count
+	// weren't reset after a success, unrelated later failures in a long-lived
+	// stream could accumulate toward the limit even with successes in
+	// between. Here there's only one failed tick total, so the stream must
+	// not give up. saturationFor queries queue and kv concurrently, so the
+	// first tick issues two Instant calls (order unspecified between them);
+	// both fail to guarantee that tick's IsActive reports an error regardless
+	// of which of the two the errgroup happens to observe first. n comes from
+	// countingSource's own mutex-guarded counter, so this closure stays safe
+	// to call concurrently from both queries without needing its own state.
+	src := &countingSource{
+		fn: func(n int) (float64, error) {
+			if n <= 2 {
+				return 0, errors.New("boom")
+			}
+			return 0, nil
+		},
+	}
+	s := newScaler(src)
+	ref := &pb.ScaledObjectRef{ScalerMetadata: map[string]string{
+		"prometheusAddress":            "unused",
+		"queueQuery":                   "queue_q",
+		"kvCacheQuery":                 "kv_q",
+		"streamPollInterval":           "2ms",
+		"streamMaxConsecutiveFailures": "2",
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	fs := &fakeStreamServer{ctx: ctx, sent: make(chan *pb.IsActiveResponse, 4)}
+
+	done := make(chan error, 1)
+	go func() { done <- s.StreamIsActive(ref, fs) }()
+
+	// Wait for a couple of successful sends -- if the lone early failure
+	// weren't reset, the stream would still be alive at this point too
+	// (2 max failures > 1 actual), so this alone wouldn't prove much; the
+	// real assertion is that the stream is still running well past what one
+	// failure plus the max would allow if failures didn't reset.
+	received := 0
+	timeout := time.After(200 * time.Millisecond)
+loop:
+	for {
+		select {
+		case <-fs.sent:
+			received++
+			if received >= 3 {
+				break loop
+			}
+		case err := <-done:
+			t.Fatalf("StreamIsActive ended unexpectedly (err=%v) after %d sends", err, received)
+		case <-timeout:
+			t.Fatalf("timed out waiting for sends, got %d", received)
+		}
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("StreamIsActive returned error after cancel: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for StreamIsActive to return after context cancel")
+	}
+}
+
+// countingSource is a metrics.Source whose behavior is driven by fn, called
+// with a 1-based count of Instant calls so far.
+type countingSource struct {
+	mu sync.Mutex
+	n  int
+	fn func(call int) (float64, error)
+}
+
+func (c *countingSource) Instant(_ context.Context, _, _ string) (float64, error) {
+	c.mu.Lock()
+	c.n++
+	n := c.n
+	c.mu.Unlock()
+	return c.fn(n)
 }
