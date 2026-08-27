@@ -86,7 +86,7 @@ func TestGRPCContract(t *testing.T) {
 		"kv_q":    0.1, // /0.7 threshold -> kvScore ~0.14, queue dominates
 	})
 	source := &metrics.Prometheus{HTTP: prom.Client()}
-	client := startContractServer(t, &scaler{source: source})
+	client := startContractServer(t, newScaler(source))
 
 	ref := &pb.ScaledObjectRef{
 		Namespace: "ns",
@@ -95,6 +95,11 @@ func TestGRPCContract(t *testing.T) {
 			"prometheusAddress": prom.URL,
 			"queueQuery":        "queue_q",
 			"kvCacheQuery":      "kv_q",
+			// Keep the contract test fast: StreamIsActive's poll interval is
+			// now per-ScaledObject config (streamPollInterval) rather than a
+			// package-level var, so it's set here instead of overridden
+			// separately in the StreamIsActive subtest below.
+			"streamPollInterval": "20ms",
 		},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -142,10 +147,6 @@ func TestGRPCContract(t *testing.T) {
 	})
 
 	t.Run("StreamIsActive", func(t *testing.T) {
-		orig := streamIsActiveInterval
-		streamIsActiveInterval = 20 * time.Millisecond
-		defer func() { streamIsActiveInterval = orig }()
-
 		streamCtx, streamCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer streamCancel()
 
