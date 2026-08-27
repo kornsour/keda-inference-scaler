@@ -9,9 +9,11 @@ import (
 
 	"github.com/kornsour/keda-inference-scaler/internal/config"
 	"github.com/kornsour/keda-inference-scaler/internal/metrics"
+	"github.com/kornsour/keda-inference-scaler/internal/observability"
 	"github.com/kornsour/keda-inference-scaler/internal/saturation"
 
 	pb "github.com/kornsour/keda-inference-scaler/externalscaler"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"google.golang.org/grpc/metadata"
 )
 
@@ -345,9 +347,8 @@ func TestStreamIsActiveSkipsSendOnTransientQueryError(t *testing.T) {
 }
 
 func TestStreamIsActiveEndsStreamAfterMaxConsecutiveFailures(t *testing.T) {
-	before := streamErrorsTotal.Value()
-
-	s := &scaler{source: &fakeSource{errs: map[string]error{"queue_q": errors.New("boom")}}}
+	m := observability.NewMetrics()
+	s := &scaler{source: &fakeSource{errs: map[string]error{"queue_q": errors.New("boom")}}, metrics: m}
 	ref := &pb.ScaledObjectRef{
 		Namespace: "ns",
 		Name:      "obj",
@@ -376,8 +377,8 @@ func TestStreamIsActiveEndsStreamAfterMaxConsecutiveFailures(t *testing.T) {
 		t.Fatal("timed out waiting for StreamIsActive to give up after repeated failures")
 	}
 
-	if got := streamErrorsTotal.Value() - before; got < 3 {
-		t.Fatalf("streamErrorsTotal increased by %d, want at least 3", got)
+	if got := testutil.ToFloat64(m.StreamErrors); got < 3 {
+		t.Fatalf("StreamErrors = %v, want at least 3", got)
 	}
 }
 

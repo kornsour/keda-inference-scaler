@@ -12,9 +12,10 @@
 // main.go owns flag/env handling, the listener, gRPC registration, and the
 // ExternalScaler methods that glue together internal/config, internal/metrics,
 // and internal/saturation. See those packages for the config parsing, metric
-// source, and saturation math respectively. It also serves internal/selfmetrics
-// on a separate HTTP port, so operational failures (e.g. a StreamIsActive that
-// keeps failing its query) are visible to a scraper, not just in logs.
+// source, and saturation math respectively. It also serves internal/observability
+// (health, readiness, and the scaler's own Prometheus instruments, including
+// StreamIsActive failure counts) on a separate HTTP port, so operational
+// failures are visible to a scraper, not just in logs.
 package main
 
 //go:generate protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative externalscaler/externalscaler.proto
@@ -23,7 +24,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
@@ -32,8 +33,8 @@ import (
 
 	"github.com/kornsour/keda-inference-scaler/internal/config"
 	"github.com/kornsour/keda-inference-scaler/internal/metrics"
+	"github.com/kornsour/keda-inference-scaler/internal/observability"
 	"github.com/kornsour/keda-inference-scaler/internal/saturation"
-	"github.com/kornsour/keda-inference-scaler/internal/selfmetrics"
 
 	pb "github.com/kornsour/keda-inference-scaler/externalscaler"
 	"google.golang.org/grpc"
@@ -41,23 +42,38 @@ import (
 
 const metricName = "inference-saturation"
 
-// selfMetrics holds the scaler's own operational counters (as opposed to
-// internal/metrics, which queries an external Prometheus about inference
-// saturation). It's served on metricsAddr; see main.
-var selfMetricsRegistry = selfmetrics.NewRegistry()
-
-// streamErrorsTotal counts StreamIsActive query failures across every open
-// stream. A Prometheus that's down or rejecting queries now shows up here —
-// visible to an external Prometheus scraping this scaler, and alertable —
-// rather than only as log lines that no one is watching in real time.
-var streamErrorsTotal = selfMetricsRegistry.NewCounter(
-	"keda_inference_scaler_stream_errors_total",
-	"Total number of StreamIsActive query failures across all streams.",
-)
-
 type scaler struct {
 	pb.UnimplementedExternalScalerServer
 	source metrics.Source
+
+	// metrics and health are the scaler's self-observability instruments.
+	// Both are nil-safe: a scaler built as a bare struct literal (as the
+	// tests do) works fine with neither wired up.
+	metrics *observability.Metrics
+	health  *observability.Health
+}
+
+// queryInstant runs one instant query, recording it as dimension (e.g.
+// "queue" or "kv") in s.metrics and, on a success, marking s.health ready.
+//
+// A well-formed empty result (metrics.ErrMissing) still counts as Prometheus
+// having answered for readiness purposes -- it just also counts as a query
+// error, since it's the case operators most want visibility into (a dropped
+// PodMonitor looks exactly like an idle system otherwise).
+func (s *scaler) queryInstant(ctx context.Context, dimension, addr, query string) (float64, error) {
+	start := time.Now()
+	v, err := s.source.Instant(ctx, addr, query)
+	s.metrics.ObserveQueryDuration(dimension, time.Since(start))
+	switch {
+	case err == nil:
+		s.health.RecordSuccess()
+	case errors.Is(err, metrics.ErrMissing):
+		s.metrics.IncQueryError(dimension)
+		s.health.RecordSuccess()
+	default:
+		s.metrics.IncQueryError(dimension)
+	}
+	return v, err
 }
 
 // saturationFor resolves c's queue and KV-cache readings from s.source and
@@ -70,7 +86,7 @@ type scaler struct {
 // otherwise indistinguishable: a dropped PodMonitor or a relabel change looks
 // exactly like no traffic.
 func (s *scaler) saturationFor(ctx context.Context, c config.Config) (float64, error) {
-	queue, err := s.source.Instant(ctx, c.PromAddr, c.QueueQuery)
+	queue, err := s.queryInstant(ctx, "queue", c.PromAddr, c.QueueQuery)
 	if err != nil {
 		if errors.Is(err, metrics.ErrMissing) && !c.TreatMissingAsError {
 			queue = 0
@@ -78,7 +94,7 @@ func (s *scaler) saturationFor(ctx context.Context, c config.Config) (float64, e
 			return 0, fmt.Errorf("queue query: %w", err)
 		}
 	}
-	kv, err := s.source.Instant(ctx, c.PromAddr, c.KVQuery)
+	kv, err := s.queryInstant(ctx, "kv", c.PromAddr, c.KVQuery)
 	if err != nil {
 		if errors.Is(err, metrics.ErrMissing) && !c.TreatMissingAsError {
 			kv = 0
@@ -90,17 +106,20 @@ func (s *scaler) saturationFor(ctx context.Context, c config.Config) (float64, e
 }
 
 func (s *scaler) IsActive(ctx context.Context, ref *pb.ScaledObjectRef) (*pb.IsActiveResponse, error) {
+	s.metrics.IncGRPCRequest("IsActive")
 	c, err := config.Parse(ref.ScalerMetadata)
 	if err != nil {
+		slog.Error("IsActive: invalid config", "namespace", ref.Namespace, "name", ref.Name, "error", err)
 		return nil, err
 	}
 	sat, err := s.saturationFor(ctx, c)
 	if err != nil {
-		log.Printf("IsActive %s/%s: %v", ref.Namespace, ref.Name, err)
+		slog.Error("IsActive", "namespace", ref.Namespace, "name", ref.Name, "error", err)
 		return nil, err
 	}
+	s.metrics.SetSaturation(ref.Namespace, ref.Name, sat)
 	active := sat > c.Activation
-	log.Printf("IsActive %s/%s saturation=%.1f active=%v", ref.Namespace, ref.Name, sat, active)
+	slog.Info("IsActive", "namespace", ref.Namespace, "name", ref.Name, "saturation", sat, "active", active)
 	return &pb.IsActiveResponse{Result: active}, nil
 }
 
@@ -128,6 +147,7 @@ func nextStreamBackoff(current, base time.Duration) time.Duration {
 // struggling Prometheus isn't polled at a constant rate, and a failure
 // counter so the condition is visible in metrics, not only in logs.
 func (s *scaler) StreamIsActive(ref *pb.ScaledObjectRef, stream pb.ExternalScaler_StreamIsActiveServer) error {
+	s.metrics.IncGRPCRequest("StreamIsActive")
 	c, err := config.Parse(ref.ScalerMetadata)
 	if err != nil {
 		return err
@@ -147,9 +167,10 @@ func (s *scaler) StreamIsActive(ref *pb.ScaledObjectRef, stream pb.ExternalScale
 			resp, err := s.IsActive(stream.Context(), ref)
 			if err != nil {
 				consecutiveFailures++
-				streamErrorsTotal.Inc()
-				log.Printf("StreamIsActive %s/%s: query failed (%d/%d consecutive failures, next retry in %s): %v",
-					ref.Namespace, ref.Name, consecutiveFailures, c.StreamMaxConsecutiveFailures, backoff, err)
+				s.metrics.IncStreamError()
+				slog.Warn("StreamIsActive: query failed", "namespace", ref.Namespace, "name", ref.Name,
+					"consecutiveFailures", consecutiveFailures, "maxConsecutiveFailures", c.StreamMaxConsecutiveFailures,
+					"backoff", backoff, "error", err)
 				if consecutiveFailures >= c.StreamMaxConsecutiveFailures {
 					return fmt.Errorf("StreamIsActive %s/%s: %d consecutive query failures, ending stream: %w",
 						ref.Namespace, ref.Name, consecutiveFailures, err)
@@ -169,6 +190,7 @@ func (s *scaler) StreamIsActive(ref *pb.ScaledObjectRef, stream pb.ExternalScale
 }
 
 func (s *scaler) GetMetricSpec(context.Context, *pb.ScaledObjectRef) (*pb.GetMetricSpecResponse, error) {
+	s.metrics.IncGRPCRequest("GetMetricSpec")
 	return &pb.GetMetricSpecResponse{
 		MetricSpecs: []*pb.MetricSpec{{
 			MetricName:      metricName,
@@ -179,16 +201,19 @@ func (s *scaler) GetMetricSpec(context.Context, *pb.ScaledObjectRef) (*pb.GetMet
 }
 
 func (s *scaler) GetMetrics(ctx context.Context, req *pb.GetMetricsRequest) (*pb.GetMetricsResponse, error) {
+	s.metrics.IncGRPCRequest("GetMetrics")
 	c, err := config.Parse(req.ScaledObjectRef.ScalerMetadata)
 	if err != nil {
+		slog.Error("GetMetrics: invalid config", "namespace", req.ScaledObjectRef.Namespace, "name", req.ScaledObjectRef.Name, "error", err)
 		return nil, err
 	}
 	sat, err := s.saturationFor(ctx, c)
 	if err != nil {
-		log.Printf("GetMetrics %s: %v", req.ScaledObjectRef.Namespace, err)
+		slog.Error("GetMetrics", "namespace", req.ScaledObjectRef.Namespace, "name", req.ScaledObjectRef.Name, "error", err)
 		return nil, err
 	}
-	log.Printf("GetMetrics %s saturation=%.1f", req.ScaledObjectRef.Namespace, sat)
+	s.metrics.SetSaturation(req.ScaledObjectRef.Namespace, req.ScaledObjectRef.Name, sat)
+	slog.Info("GetMetrics", "namespace", req.ScaledObjectRef.Namespace, "name", req.ScaledObjectRef.Name, "saturation", sat)
 	return &pb.GetMetricsResponse{
 		MetricValues: []*pb.MetricValue{{
 			MetricName:       metricName,
@@ -198,34 +223,52 @@ func (s *scaler) GetMetrics(ctx context.Context, req *pb.GetMetricsRequest) (*pb
 	}, nil
 }
 
+// readyWindow is how long a successful Prometheus query keeps /readyz
+// passing, overridable via READY_WINDOW (e.g. "90s") for deployments whose
+// KEDA polling interval warrants a wider or narrower margin.
+const defaultReadyWindow = 2 * time.Minute
+
 func main() {
 	addr := os.Getenv("LISTEN_ADDR")
 	if addr == "" {
 		addr = ":6000"
 	}
-	lis, err := net.Listen("tcp", addr)
-	if err != nil {
-		log.Fatalf("listen %s: %v", addr, err)
+	httpAddr := os.Getenv("HTTP_ADDR")
+	if httpAddr == "" {
+		httpAddr = ":8080"
+	}
+	readyWindow := defaultReadyWindow
+	if v := os.Getenv("READY_WINDOW"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			readyWindow = d
+		} else {
+			slog.Warn("READY_WINDOW is not a valid duration, using default", "value", v, "default", defaultReadyWindow)
+		}
 	}
 
-	metricsAddr := os.Getenv("METRICS_LISTEN_ADDR")
-	if metricsAddr == "" {
-		metricsAddr = ":9090"
+	lis, err := net.Listen("tcp", addr)
+	if err != nil {
+		slog.Error("listen", "addr", addr, "error", err)
+		os.Exit(1)
 	}
+
+	obsMetrics := observability.NewMetrics()
+	health := observability.NewHealth(readyWindow)
+
+	httpSrv := observability.NewServer(httpAddr, obsMetrics, health)
 	go func() {
-		mux := http.NewServeMux()
-		mux.Handle("/metrics", selfMetricsRegistry.Handler())
-		log.Printf("keda-inference-scaler metrics listening on %s", metricsAddr)
-		if err := http.ListenAndServe(metricsAddr, mux); err != nil {
-			log.Printf("metrics server on %s: %v", metricsAddr, err)
+		slog.Info("observability server listening", "addr", httpAddr)
+		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("observability server", "error", err)
 		}
 	}()
 
 	srv := grpc.NewServer()
 	source := &metrics.Prometheus{HTTP: &http.Client{Timeout: 5 * time.Second}}
-	pb.RegisterExternalScalerServer(srv, &scaler{source: source})
-	log.Printf("keda-inference-scaler listening on %s", addr)
+	pb.RegisterExternalScalerServer(srv, &scaler{source: source, metrics: obsMetrics, health: health})
+	slog.Info("keda-inference-scaler listening", "addr", addr)
 	if err := srv.Serve(lis); err != nil {
-		log.Fatalf("serve: %v", err)
+		slog.Error("serve", "error", err)
+		os.Exit(1)
 	}
 }
