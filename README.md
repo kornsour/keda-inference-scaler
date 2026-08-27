@@ -57,10 +57,36 @@ Commit the regenerated `*.pb.go` files alongside the `.proto` change.
 ## Deploy
 
 ```bash
-kubectl apply -f deploy/scaler.yaml                 # the scaler (Deployment + Service :6000)
+kubectl apply -f deploy/scaler.yaml                 # the scaler (Deployment + Service :6000/:8080)
 kubectl apply -f deploy/scaledobject-external.yaml  # a KEDA ScaledObject that uses it
 kubectl get scaledobject,hpa -n inference
 ```
+
+## Observability
+
+Alongside the gRPC port (`:6000`, `LISTEN_ADDR`), the scaler runs a small HTTP listener
+(`:8080` by default, `HTTP_ADDR`) for its own health and metrics — separate from the metrics
+it *queries* about the workload it scales:
+
+| path | purpose |
+|---|---|
+| `/healthz` | process liveness; never depends on Prometheus |
+| `/readyz` | fails when the configured Prometheus hasn't answered successfully within the readiness window (`READY_WINDOW`, default `2m`) — a scaler that can't see its data source isn't marked ready, even though the process itself is fine |
+| `/metrics` | Prometheus exposition of the scaler's own instruments |
+
+Both `deploy/scaler.yaml`'s `livenessProbe` and `readinessProbe` point at these.
+
+Instruments exported on `/metrics`:
+
+| metric | type | labels | meaning |
+|---|---|---|---|
+| `scaler_prometheus_query_duration_seconds` | histogram | `dimension` (`queue`/`kv`) | latency of instant queries the scaler issues |
+| `scaler_prometheus_query_errors_total` | counter | `dimension` | instant queries that didn't return a usable value (transport/decode failure, or an absent series) |
+| `scaler_saturation` | gauge | `namespace`, `scaledobject` | last computed composite saturation score |
+| `scaler_grpc_requests_total` | counter | `method` | `ExternalScaler` gRPC calls handled |
+
+Logging is structured (`log/slog`, JSON-free key/value text by default) with `namespace`,
+`name`, and `saturation` as queryable fields rather than embedded in a format string.
 
 ## Configuration (`ScaledObject` `trigger.metadata`)
 

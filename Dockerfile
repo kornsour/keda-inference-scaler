@@ -16,6 +16,6 @@ RUN protoc --go_out=. --go_opt=paths=source_relative \
 
 FROM gcr.io/distroless/static:nonroot
 COPY --from=build /keda-inference-scaler /keda-inference-scaler
-EXPOSE 6000
+EXPOSE 6000 8080
 USER nonroot:nonroot
 ENTRYPOINT ["/keda-inference-scaler"]
