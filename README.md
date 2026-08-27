@@ -26,13 +26,33 @@ failure modes covered — which a single PromQL trigger can't express.
 ## Build & test
 
 ```bash
-make test     # go vet + unit tests (generates gRPC stubs first)
+git clone https://github.com/kornsour/keda-inference-scaler && cd keda-inference-scaler
+make test     # go vet + unit tests
 make build    # static binary in ./bin
 make image    # container image (protoc + build inside Docker)
 ```
 
-Stubs under `externalscaler/` are generated from `externalscaler.proto` (KEDA's
-external-scaler contract) via `make proto`, or automatically in the Dockerfile / CI.
+These work right after a clone with nothing but Go installed — the gRPC stubs under
+`externalscaler/` (generated from `externalscaler.proto`, KEDA's external-scaler contract)
+are checked into the repo, not generated on the fly.
+
+### Regenerating the stubs
+
+Only needed after editing `externalscaler/externalscaler.proto`:
+
+```bash
+make proto    # or: go generate ./...
+```
+
+Requires `protoc` plus the `protoc-gen-go` and `protoc-gen-go-grpc` plugins on `PATH`:
+
+```bash
+brew install protobuf   # or your package manager's protobuf-compiler
+go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.10
+go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
+```
+
+Commit the regenerated `*.pb.go` files alongside the `.proto` change.
 
 ## Deploy
 

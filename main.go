@@ -10,6 +10,8 @@
 // >100 == scale out). That composite can't be expressed as one PromQL trigger.
 package main
 
+//go:generate protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative externalscaler/externalscaler.proto
+
 import (
 	"context"
 	"encoding/json"
