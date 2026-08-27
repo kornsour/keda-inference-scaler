@@ -1,0 +1,46 @@
+name: e2e
+
+# The heavy, "worth it once" half of issue #9: a kind cluster with a real KEDA
+# install, exercising deploy/ end to end against a fake vLLM metrics endpoint.
+# Kept out of the per-push `ci` workflow (see ci.yml, which carries the cheap
+# gRPC contract test instead) so every PR doesn't pay for a cluster bring-up;
+# runs on demand and after anything that could change its outcome lands on
+# main, and uploads the same evidence test/e2e/run.sh writes locally.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "deploy/**"
+      - "test/e2e/**"
+      - "main.go"
+      - "internal/**"
+      - "externalscaler/**"
+      - "Dockerfile"
+      - ".github/workflows/e2e.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  kind-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.25"
+      - name: install kind + helm
+        run: |
+          curl -Lo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.31.0/kind-linux-amd64
+          chmod +x /usr/local/bin/kind
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      - name: run kind e2e smoke
+        run: test/e2e/run.sh
+      - name: upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-evidence
+          path: test/e2e/evidence/
+          if-no-files-found: warn

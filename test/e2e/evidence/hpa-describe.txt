@@ -1,0 +1,28 @@
+# kubectl describe hpa -n inference keda-hpa-vllm-inference
+# captured 2026-08-27T17:56:10Z
+
+Name:                                                keda-hpa-vllm-inference
+Namespace:                                           inference
+Labels:                                              app.kubernetes.io/managed-by=keda-operator
+                                                     app.kubernetes.io/name=keda-hpa-vllm-inference
+                                                     app.kubernetes.io/part-of=vllm-inference
+                                                     app.kubernetes.io/version=2.20.2
+                                                     scaledobject.keda.sh/name=vllm-inference
+Annotations:                                         <none>
+CreationTimestamp:                                   Thu, 27 Aug 2026 13:55:54 -0400
+Reference:                                           Deployment/vllm
+Metrics:                                             ( current / target )
+  "s0-inference-saturation" (target average value):  300 / 100
+Min replicas:                                        1
+Max replicas:                                        2
+Deployment pods:                                     1 current / 2 desired
+Conditions:
+  Type            Status  Reason            Message
+  ----            ------  ------            -------
+  AbleToScale     True    SucceededRescale  the HPA controller was able to update the target scale to 2
+  ScalingActive   True    ValidMetricFound  the HPA was able to successfully calculate a replica count from external metric s0-inference-saturation(&LabelSelector{MatchLabels:map[string]string{scaledobject.keda.sh/name: vllm-inference,},MatchExpressions:[]LabelSelectorRequirement{},})
+  ScalingLimited  True    TooManyReplicas   the desired replica count is more than the maximum replica count
+Events:
+  Type    Reason             Age   From                       Message
+  ----    ------             ----  ----                       -------
+  Normal  SuccessfulRescale  1s    horizontal-pod-autoscaler  New size: 2; reason: external metric s0-inference-saturation(&LabelSelector{MatchLabels:map[string]string{scaledobject.keda.sh/name: vllm-inference,},MatchExpressions:[]LabelSelectorRequirement{},}) above target

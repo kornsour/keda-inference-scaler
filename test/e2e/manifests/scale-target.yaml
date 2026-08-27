@@ -1,0 +1,29 @@
+# A trivial stand-in for the vLLM Deployment that deploy/scaledobject-external.yaml
+# scales (scaleTargetRef: vllm). It only needs to exist and expose a /scale
+# subresource for KEDA/the HPA controller to manage — its actual behavior is
+# irrelevant to what this smoke test asserts (that the HPA reports the
+# inference-saturation external metric).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm
+  namespace: inference
+  labels:
+    app: vllm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+    spec:
+      containers:
+        - name: placeholder
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests:
+              cpu: 5m
+              memory: 8Mi

@@ -8,7 +8,10 @@ spec:
   scaleTargetRef:
     name: vllm                       # your vLLM Deployment
   minReplicaCount: 1
-  maxReplicaCount: 4
+  # Matches the maxReplicaCount vendored into inference-platform's capstone
+  # cluster (phase-2-capstone/keda-inference-scaler/deploy/scaledobject-external.yaml)
+  # so this example describes the same cluster, not a diverged copy.
+  maxReplicaCount: 2
   pollingInterval: 15
   cooldownPeriod: 60
   triggers:

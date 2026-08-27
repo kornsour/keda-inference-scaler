@@ -1,0 +1,11 @@
+NAME                                  SCALETARGETKIND      SCALETARGETNAME   MIN   MAX   READY   ACTIVE   FALLBACK   PAUSED   TRIGGERS   AUTHENTICATIONS   AGE
+scaledobject.keda.sh/vllm-inference   apps/v1.Deployment   vllm              1     2     True    True     False      False    external                     17s
+
+NAME                                                          REFERENCE         TARGETS         MINPODS   MAXPODS   REPLICAS   AGE
+horizontalpodautoscaler.autoscaling/keda-hpa-vllm-inference   Deployment/vllm   300/100 (avg)   1         2         1          16s
+
+NAME                                     READY   STATUS    RESTARTS   AGE   IP            NODE                                      NOMINATED NODE   READINESS GATES
+pod/fake-vllm-metrics-54bc686b46-95n2p   1/1     Running   0          19s   10.244.0.9    keda-inference-scaler-e2e-control-plane   <none>           <none>
+pod/inference-scaler-9cfbb4d97-9kwd6     1/1     Running   0          19s   10.244.0.8    keda-inference-scaler-e2e-control-plane   <none>           <none>
+pod/vllm-6b96567684-dsr5b                1/1     Running   0          1s    10.244.0.11   keda-inference-scaler-e2e-control-plane   <none>           <none>
+pod/vllm-6b96567684-lxvwr                1/1     Running   0          19s   10.244.0.10   keda-inference-scaler-e2e-control-plane   <none>           <none>
