@@ -87,8 +87,12 @@ func (s *scaler) IsActive(ctx context.Context, ref *pb.ScaledObjectRef) (*pb.IsA
 	return &pb.IsActiveResponse{Result: active}, nil
 }
 
+// streamIsActiveInterval is the StreamIsActive poll period; overridden in
+// tests so the stream doesn't have to run in real time.
+var streamIsActiveInterval = 10 * time.Second
+
 func (s *scaler) StreamIsActive(ref *pb.ScaledObjectRef, stream pb.ExternalScaler_StreamIsActiveServer) error {
-	t := time.NewTicker(10 * time.Second)
+	t := time.NewTicker(streamIsActiveInterval)
 	defer t.Stop()
 	for {
 		select {

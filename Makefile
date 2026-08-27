@@ -1,5 +1,13 @@
 PROTO := externalscaler/externalscaler.proto
 
+# Minimum acceptable statement coverage across the module (see `make test`).
+COVERAGE_FLOOR := 80
+
+# Packages whose statements count toward the coverage floor: our own code,
+# not the generated gRPC stubs under externalscaler/ (those aren't unit
+# tested and would otherwise drag the ratio down).
+COVERPKG := github.com/kornsour/keda-inference-scaler,github.com/kornsour/keda-inference-scaler/internal/...
+
 # Regenerate the committed gRPC stubs under externalscaler/ after editing the
 # .proto file (requires protoc + protoc-gen-go + protoc-gen-go-grpc on PATH;
 # see README Prerequisites). Not needed to build or test — the generated
@@ -20,7 +28,13 @@ build: tidy
 .PHONY: test
 test:
 	go vet ./...
-	go test ./...
+	go test ./... -coverpkg=$(COVERPKG) -covermode=atomic -coverprofile=coverage.out
+	@go tool cover -func=coverage.out | tail -1
+	@pct=$$(go tool cover -func=coverage.out | tail -1 | grep -oE '[0-9]+\.[0-9]+'); \
+	awk -v p="$$pct" -v floor="$(COVERAGE_FLOOR)" 'BEGIN { \
+		if (p+0 < floor+0) { printf "coverage %.1f%% is below floor %s%%\n", p, floor; exit 1 } \
+		else { printf "coverage %.1f%% meets floor %s%%\n", p, floor } \
+	}'
 
 .PHONY: image
 image:

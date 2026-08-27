@@ -52,3 +52,37 @@ func TestInstantNonOKStatus(t *testing.T) {
 		t.Fatal("expected error for non-200 response")
 	}
 }
+
+func TestInstantMalformedJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{not valid json`))
+	}))
+	defer srv.Close()
+	p := &Prometheus{HTTP: srv.Client()}
+	if _, err := p.Instant(context.Background(), srv.URL, "q"); err == nil {
+		t.Fatal("expected error on malformed JSON")
+	}
+}
+
+func TestInstantUndecodableValueIsErrMissing(t *testing.T) {
+	// Prometheus always encodes the sample value as a JSON string, but
+	// Instant only type-asserts — a well-formed response whose value[1]
+	// decodes as a number (not a string) is treated the same as an absent
+	// series: ErrMissing, not a silent fallback to 0. Pin that behavior.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[0,42]}]}}`))
+	}))
+	defer srv.Close()
+	p := &Prometheus{HTTP: srv.Client()}
+	v, err := p.Instant(context.Background(), srv.URL, "q")
+	if !errors.Is(err, ErrMissing) {
+		t.Fatalf("expected ErrMissing for non-string value, got value=%.2f err=%v", v, err)
+	}
+}
+
+func TestInstantRequestConstructionError(t *testing.T) {
+	p := &Prometheus{HTTP: http.DefaultClient}
+	if _, err := p.Instant(context.Background(), "://bad-url", "q"); err == nil {
+		t.Fatal("expected error building the request for an invalid address")
+	}
+}
