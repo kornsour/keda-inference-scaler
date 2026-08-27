@@ -73,6 +73,8 @@ kubectl get scaledobject,hpa -n inference
 | `kvCacheThreshold` | `0.7` | KV-cache fraction that counts as "at threshold" |
 | `activationThreshold` | `1` | saturation below which the target may scale to zero |
 | `treatMissingAsError` | `false` | see below |
+| `streamPollIntervalSeconds` | `10` | how often `StreamIsActive` polls while queries are succeeding; independent of the ScaledObject's own `pollingInterval`, which governs the `IsActive`/`GetMetrics` fallback path |
+| `streamMaxConsecutiveFailures` | `5` | consecutive `StreamIsActive` query failures tolerated before the stream gives up and returns an error, letting KEDA re-establish it |
 
 The default queries use vLLM's metric names; override them for other engines that expose
 queue-depth / KV-cache equivalents.
@@ -90,6 +92,17 @@ zero replicas indefinitely while requests queue, because the scaler can't tell "
 Set `treatMissingAsError: "true"` to fail loud instead: `IsActive`/`GetMetrics` return an
 error (visible in the scaler's logs and KEDA's) whenever either query's series is absent,
 rather than silently reporting saturation `0`.
+
+### StreamIsActive failure handling
+
+A `StreamIsActive` query failure (e.g. Prometheus is down or unreachable) is logged with the
+ScaledObject's namespace/name and counted in `keda_inference_scaler_stream_errors_total`,
+served in Prometheus text format on `:9090/metrics` (override the address with the
+`METRICS_LISTEN_ADDR` env var). Consecutive failures back off — doubling the poll interval up
+to 8x — instead of retrying a struggling target at a constant rate, and reset once a query
+succeeds. After `streamMaxConsecutiveFailures` consecutive failures, the stream returns an
+error and ends rather than staying open indefinitely with nothing to send; KEDA re-establishes
+it on its own.
 
 ## Archive
 

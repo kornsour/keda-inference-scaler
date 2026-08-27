@@ -6,6 +6,7 @@ package config
 import (
 	"fmt"
 	"strconv"
+	"time"
 )
 
 const (
@@ -14,6 +15,17 @@ const (
 	defaultQueueThreshold = 3.0
 	defaultKVThreshold    = 0.7
 	defaultActivation     = 1.0
+
+	// defaultStreamPollInterval is StreamIsActive's poll period when
+	// streamPollIntervalSeconds isn't set. This is the interval used between
+	// successful polls; on failures the scaler backs off beyond it.
+	defaultStreamPollInterval = 10 * time.Second
+
+	// defaultStreamMaxConsecutiveFailures is how many consecutive
+	// StreamIsActive query failures are tolerated before the stream gives up
+	// and returns an error, letting KEDA re-establish it, when
+	// streamMaxConsecutiveFailures isn't set.
+	defaultStreamMaxConsecutiveFailures = 5
 )
 
 // Config holds one ScaledObject's resolved scaler metadata.
@@ -30,17 +42,29 @@ type Config struct {
 	// "idle" are otherwise indistinguishable: a dropped PodMonitor or a
 	// relabel change looks exactly like no traffic.
 	TreatMissingAsError bool
+
+	// StreamPollInterval is how often StreamIsActive polls while queries are
+	// succeeding. It is independent of KEDA's own ScaledObject-level
+	// pollingInterval, which governs the IsActive/GetMetrics fallback path.
+	StreamPollInterval time.Duration
+
+	// StreamMaxConsecutiveFailures is how many consecutive query failures
+	// StreamIsActive tolerates, backing off between them, before it returns
+	// an error and ends the stream rather than holding it open indefinitely.
+	StreamMaxConsecutiveFailures int
 }
 
 // Parse builds a Config from a KEDA ScaledObjectRef's ScalerMetadata map, applying
 // defaults for anything not set. prometheusAddress is the only required key.
 func Parse(m map[string]string) (Config, error) {
 	c := Config{
-		QueueQuery:     defaultQueueQuery,
-		KVQuery:        defaultKVCacheQuery,
-		QueueThreshold: defaultQueueThreshold,
-		KVThreshold:    defaultKVThreshold,
-		Activation:     defaultActivation,
+		QueueQuery:                   defaultQueueQuery,
+		KVQuery:                      defaultKVCacheQuery,
+		QueueThreshold:               defaultQueueThreshold,
+		KVThreshold:                  defaultKVThreshold,
+		Activation:                   defaultActivation,
+		StreamPollInterval:           defaultStreamPollInterval,
+		StreamMaxConsecutiveFailures: defaultStreamMaxConsecutiveFailures,
 	}
 	c.PromAddr = m["prometheusAddress"]
 	if c.PromAddr == "" {
@@ -56,6 +80,8 @@ func Parse(m map[string]string) (Config, error) {
 	c.KVThreshold = floatOr(m["kvCacheThreshold"], c.KVThreshold)
 	c.Activation = floatOr(m["activationThreshold"], c.Activation)
 	c.TreatMissingAsError = boolOr(m["treatMissingAsError"], false)
+	c.StreamPollInterval = durationSecondsOr(m["streamPollIntervalSeconds"], c.StreamPollInterval)
+	c.StreamMaxConsecutiveFailures = positiveIntOr(m["streamMaxConsecutiveFailures"], c.StreamMaxConsecutiveFailures)
 	return c, nil
 }
 
@@ -77,4 +103,31 @@ func boolOr(s string, def bool) bool {
 		return b
 	}
 	return def
+}
+
+// durationSecondsOr parses s as a number of seconds (fractional seconds
+// allowed, e.g. "0.5"). Empty, unparsable, or non-positive input falls back
+// to def — a zero or negative interval would spin the stream loop tightly.
+func durationSecondsOr(s string, def time.Duration) time.Duration {
+	if s == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil || f <= 0 {
+		return def
+	}
+	return time.Duration(f * float64(time.Second))
+}
+
+// positiveIntOr parses s as an integer. Empty, unparsable, or non-positive
+// input falls back to def.
+func positiveIntOr(s string, def int) int {
+	if s == "" {
+		return def
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 1 {
+		return def
+	}
+	return n
 }

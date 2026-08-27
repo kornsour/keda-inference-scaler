@@ -22,6 +22,8 @@ spec:
           ports:
             - name: grpc
               containerPort: 6000
+            - name: metrics
+              containerPort: 9090
           resources:
             requests:
               cpu: 25m
@@ -42,3 +44,6 @@ spec:
     - name: grpc
       port: 6000
       targetPort: 6000
+    - name: metrics
+      port: 9090
+      targetPort: 9090

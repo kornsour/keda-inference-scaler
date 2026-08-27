@@ -12,7 +12,9 @@
 // main.go owns flag/env handling, the listener, gRPC registration, and the
 // ExternalScaler methods that glue together internal/config, internal/metrics,
 // and internal/saturation. See those packages for the config parsing, metric
-// source, and saturation math respectively.
+// source, and saturation math respectively. It also serves internal/selfmetrics
+// on a separate HTTP port, so operational failures (e.g. a StreamIsActive that
+// keeps failing its query) are visible to a scraper, not just in logs.
 package main
 
 //go:generate protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative externalscaler/externalscaler.proto
@@ -31,12 +33,27 @@ import (
 	"github.com/kornsour/keda-inference-scaler/internal/config"
 	"github.com/kornsour/keda-inference-scaler/internal/metrics"
 	"github.com/kornsour/keda-inference-scaler/internal/saturation"
+	"github.com/kornsour/keda-inference-scaler/internal/selfmetrics"
 
 	pb "github.com/kornsour/keda-inference-scaler/externalscaler"
 	"google.golang.org/grpc"
 )
 
 const metricName = "inference-saturation"
+
+// selfMetrics holds the scaler's own operational counters (as opposed to
+// internal/metrics, which queries an external Prometheus about inference
+// saturation). It's served on metricsAddr; see main.
+var selfMetricsRegistry = selfmetrics.NewRegistry()
+
+// streamErrorsTotal counts StreamIsActive query failures across every open
+// stream. A Prometheus that's down or rejecting queries now shows up here —
+// visible to an external Prometheus scraping this scaler, and alertable —
+// rather than only as log lines that no one is watching in real time.
+var streamErrorsTotal = selfMetricsRegistry.NewCounter(
+	"keda_inference_scaler_stream_errors_total",
+	"Total number of StreamIsActive query failures across all streams.",
+)
 
 type scaler struct {
 	pb.UnimplementedExternalScalerServer
@@ -87,25 +104,66 @@ func (s *scaler) IsActive(ctx context.Context, ref *pb.ScaledObjectRef) (*pb.IsA
 	return &pb.IsActiveResponse{Result: active}, nil
 }
 
-// streamIsActiveInterval is the StreamIsActive poll period; overridden in
-// tests so the stream doesn't have to run in real time.
-var streamIsActiveInterval = 10 * time.Second
+// maxStreamBackoffMultiplier caps how far StreamIsActive backs off between
+// repeated query failures, as a multiple of the configured poll interval:
+// interval, 2x, 4x, ... up to this multiple. This keeps a struggling
+// Prometheus from being hammered at a constant rate while still checking
+// periodically enough to recover promptly once it comes back.
+const maxStreamBackoffMultiplier = 8
 
+// nextStreamBackoff doubles current, capped at base * maxStreamBackoffMultiplier.
+func nextStreamBackoff(current, base time.Duration) time.Duration {
+	next := current * 2
+	if capped := base * maxStreamBackoffMultiplier; next > capped {
+		next = capped
+	}
+	return next
+}
+
+// StreamIsActive polls saturation on an interval and pushes IsActive results
+// to KEDA. Unlike the unary IsActive/GetMetrics path, a broken stream
+// produces no message at all by default, so query failures here get the same
+// treatment IsActive already gives them (logged, and ultimately surfaced to
+// KEDA) plus two things the unary path doesn't need: a backoff so a
+// struggling Prometheus isn't polled at a constant rate, and a failure
+// counter so the condition is visible in metrics, not only in logs.
 func (s *scaler) StreamIsActive(ref *pb.ScaledObjectRef, stream pb.ExternalScaler_StreamIsActiveServer) error {
-	t := time.NewTicker(streamIsActiveInterval)
-	defer t.Stop()
+	c, err := config.Parse(ref.ScalerMetadata)
+	if err != nil {
+		return err
+	}
+
+	timer := time.NewTimer(c.StreamPollInterval)
+	defer timer.Stop()
+
+	backoff := c.StreamPollInterval
+	consecutiveFailures := 0
+
 	for {
 		select {
 		case <-stream.Context().Done():
 			return nil
-		case <-t.C:
+		case <-timer.C:
 			resp, err := s.IsActive(stream.Context(), ref)
 			if err != nil {
+				consecutiveFailures++
+				streamErrorsTotal.Inc()
+				log.Printf("StreamIsActive %s/%s: query failed (%d/%d consecutive failures, next retry in %s): %v",
+					ref.Namespace, ref.Name, consecutiveFailures, c.StreamMaxConsecutiveFailures, backoff, err)
+				if consecutiveFailures >= c.StreamMaxConsecutiveFailures {
+					return fmt.Errorf("StreamIsActive %s/%s: %d consecutive query failures, ending stream: %w",
+						ref.Namespace, ref.Name, consecutiveFailures, err)
+				}
+				backoff = nextStreamBackoff(backoff, c.StreamPollInterval)
+				timer.Reset(backoff)
 				continue
 			}
+			consecutiveFailures = 0
+			backoff = c.StreamPollInterval
 			if err := stream.Send(resp); err != nil {
 				return err
 			}
+			timer.Reset(c.StreamPollInterval)
 		}
 	}
 }
@@ -149,6 +207,20 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen %s: %v", addr, err)
 	}
+
+	metricsAddr := os.Getenv("METRICS_LISTEN_ADDR")
+	if metricsAddr == "" {
+		metricsAddr = ":9090"
+	}
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", selfMetricsRegistry.Handler())
+		log.Printf("keda-inference-scaler metrics listening on %s", metricsAddr)
+		if err := http.ListenAndServe(metricsAddr, mux); err != nil {
+			log.Printf("metrics server on %s: %v", metricsAddr, err)
+		}
+	}()
+
 	srv := grpc.NewServer()
 	source := &metrics.Prometheus{HTTP: &http.Client{Timeout: 5 * time.Second}}
 	pb.RegisterExternalScalerServer(srv, &scaler{source: source})
