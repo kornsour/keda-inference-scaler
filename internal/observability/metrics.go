@@ -24,6 +24,7 @@ type Metrics struct {
 	QueryErrors   *prometheus.CounterVec
 	Saturation    *prometheus.GaugeVec
 	GRPCRequests  *prometheus.CounterVec
+	StreamErrors  prometheus.Counter
 
 	registry *prometheus.Registry
 }
@@ -51,6 +52,10 @@ func NewMetrics() *Metrics {
 			Name: "scaler_grpc_requests_total",
 			Help: "Count of ExternalScaler gRPC requests handled, by method.",
 		}, []string{"method"}),
+		StreamErrors: f.NewCounter(prometheus.CounterOpts{
+			Name: "scaler_stream_errors_total",
+			Help: "Count of StreamIsActive query failures across all streams.",
+		}),
 		registry: reg,
 	}
 }
@@ -98,4 +103,15 @@ func (m *Metrics) IncGRPCRequest(method string) {
 		return
 	}
 	m.GRPCRequests.WithLabelValues(method).Inc()
+}
+
+// IncStreamError records a StreamIsActive query failure. Unlike the unary
+// IsActive/GetMetrics path, a broken stream produces no response message at
+// all by default, so this is what makes "Prometheus has been unreachable for
+// the last hour" visible to a scraper rather than only sitting in logs.
+func (m *Metrics) IncStreamError() {
+	if m == nil {
+		return
+	}
+	m.StreamErrors.Inc()
 }

@@ -12,7 +12,10 @@
 // main.go owns flag/env handling, the listener, gRPC registration, and the
 // ExternalScaler methods that glue together internal/config, internal/metrics,
 // and internal/saturation. See those packages for the config parsing, metric
-// source, and saturation math respectively.
+// source, and saturation math respectively. It also serves internal/observability
+// (health, readiness, and the scaler's own Prometheus instruments, including
+// StreamIsActive failure counts) on a separate HTTP port, so operational
+// failures are visible to a scraper, not just in logs.
 package main
 
 //go:generate protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative externalscaler/externalscaler.proto
@@ -155,30 +158,71 @@ func (s *scaler) IsActive(ctx context.Context, ref *pb.ScaledObjectRef) (*pb.IsA
 	return &pb.IsActiveResponse{Result: active}, nil
 }
 
-// StreamIsActive polls IsActive on a per-ScaledObject ticker (its interval
-// set by c.StreamPollInterval, configurable via the streamPollInterval
+// maxStreamBackoffMultiplier caps how far StreamIsActive backs off between
+// repeated query failures, as a multiple of the configured poll interval:
+// interval, 2x, 4x, ... up to this multiple. This keeps a struggling
+// Prometheus from being hammered at a constant rate while still checking
+// periodically enough to recover promptly once it comes back.
+const maxStreamBackoffMultiplier = 8
+
+// nextStreamBackoff doubles current, capped at base * maxStreamBackoffMultiplier.
+func nextStreamBackoff(current, base time.Duration) time.Duration {
+	next := current * 2
+	if capped := base * maxStreamBackoffMultiplier; next > capped {
+		next = capped
+	}
+	return next
+}
+
+// StreamIsActive polls IsActive on a per-ScaledObject interval (set by
+// c.StreamPollInterval, configurable via the streamPollInterval
 // scaler-metadata key rather than a single hardcoded value shared by every
-// ScaledObject) and pushes each result on the stream.
+// ScaledObject) and pushes each result on the stream. Unlike the unary
+// IsActive/GetMetrics path, a broken stream produces no message at all by
+// default, so query failures here get the same treatment IsActive already
+// gives them (logged, and ultimately surfaced to KEDA) plus two things the
+// unary path doesn't need: a backoff so a struggling Prometheus isn't polled
+// at a constant rate, and a failure counter so the condition is visible in
+// metrics, not only in logs.
 func (s *scaler) StreamIsActive(ref *pb.ScaledObjectRef, stream pb.ExternalScaler_StreamIsActiveServer) error {
 	s.metrics.IncGRPCRequest("StreamIsActive")
 	c, err := config.Parse(ref.ScalerMetadata)
 	if err != nil {
 		return err
 	}
-	t := time.NewTicker(c.StreamPollInterval)
-	defer t.Stop()
+
+	timer := time.NewTimer(c.StreamPollInterval)
+	defer timer.Stop()
+
+	backoff := c.StreamPollInterval
+	consecutiveFailures := 0
+
 	for {
 		select {
 		case <-stream.Context().Done():
 			return nil
-		case <-t.C:
+		case <-timer.C:
 			resp, err := s.IsActive(stream.Context(), ref)
 			if err != nil {
+				consecutiveFailures++
+				s.metrics.IncStreamError()
+				slog.Warn("StreamIsActive: query failed", "namespace", ref.Namespace, "name", ref.Name,
+					"consecutiveFailures", consecutiveFailures, "maxConsecutiveFailures", c.StreamMaxConsecutiveFailures,
+					"backoff", backoff, "error", err)
+				if consecutiveFailures >= c.StreamMaxConsecutiveFailures {
+					return fmt.Errorf("StreamIsActive %s/%s: %d consecutive query failures, ending stream: %w",
+						ref.Namespace, ref.Name, consecutiveFailures, err)
+				}
+				backoff = nextStreamBackoff(backoff, c.StreamPollInterval)
+				timer.Reset(backoff)
 				continue
 			}
+			consecutiveFailures = 0
+			backoff = c.StreamPollInterval
 			if err := stream.Send(resp); err != nil {
 				return err
 			}
+			timer.Reset(c.StreamPollInterval)
 		}
 	}
 }

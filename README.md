@@ -84,6 +84,7 @@ Instruments exported on `/metrics`:
 | `scaler_prometheus_query_errors_total` | counter | `dimension` | instant queries that didn't return a usable value (transport/decode failure, or an absent series) |
 | `scaler_saturation` | gauge | `namespace`, `scaledobject` | last computed composite saturation score |
 | `scaler_grpc_requests_total` | counter | `method` | `ExternalScaler` gRPC calls handled |
+| `scaler_stream_errors_total` | counter | _(none)_ | `StreamIsActive` query failures across all streams |
 
 Logging is structured (`log/slog`, JSON-free key/value text by default) with `namespace`,
 `name`, and `saturation` as queryable fields rather than embedded in a format string.
@@ -100,7 +101,8 @@ Logging is structured (`log/slog`, JSON-free key/value text by default) with `na
 | `activationThreshold` | `1` | saturation below which the target may scale to zero |
 | `treatMissingAsError` | `false` | see below |
 | `cacheTTL` | `15s` | how long a Prometheus reading is reused before re-querying; Go duration syntax (e.g. `10s`, `1m`). `0` disables caching |
-| `streamPollInterval` | `10s` | how often `StreamIsActive` re-evaluates and pushes a result; Go duration syntax |
+| `streamPollInterval` | `10s` | how often `StreamIsActive` polls while queries are succeeding; Go duration syntax; independent of the ScaledObject's own `pollingInterval`, which governs the `IsActive`/`GetMetrics` fallback path |
+| `streamMaxConsecutiveFailures` | `5` | consecutive `StreamIsActive` query failures tolerated before the stream gives up and returns an error, letting KEDA re-establish it |
 
 The default queries use vLLM's metric names; override them for other engines that expose
 queue-depth / KV-cache equivalents.
@@ -133,6 +135,16 @@ zero replicas indefinitely while requests queue, because the scaler can't tell "
 Set `treatMissingAsError: "true"` to fail loud instead: `IsActive`/`GetMetrics` return an
 error (visible in the scaler's logs and KEDA's) whenever either query's series is absent,
 rather than silently reporting saturation `0`.
+
+### StreamIsActive failure handling
+
+A `StreamIsActive` query failure (e.g. Prometheus is down or unreachable) is logged with the
+ScaledObject's namespace/name and counted in `scaler_stream_errors_total`, served alongside the
+scaler's other instruments on `/metrics` (see [Observability](#observability) above). Consecutive
+failures back off — doubling the poll interval up to 8x — instead of retrying a struggling target
+at a constant rate, and reset once a query succeeds. After `streamMaxConsecutiveFailures`
+consecutive failures, the stream returns an error and ends rather than staying open indefinitely
+with nothing to send; KEDA re-establishes it on its own.
 
 ## Archive
 

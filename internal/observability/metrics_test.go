@@ -15,6 +15,9 @@ func TestMetricsRecordAndExpose(t *testing.T) {
 	m.SetSaturation("inference", "vllm", 142.5)
 	m.IncGRPCRequest("IsActive")
 	m.IncGRPCRequest("IsActive")
+	m.IncStreamError()
+	m.IncStreamError()
+	m.IncStreamError()
 
 	if got := testutil.CollectAndCount(m.QueryDuration); got != 1 {
 		t.Fatalf("QueryDuration series count = %d, want 1", got)
@@ -28,6 +31,9 @@ func TestMetricsRecordAndExpose(t *testing.T) {
 	if got := testutil.ToFloat64(m.GRPCRequests.WithLabelValues("IsActive")); got != 2 {
 		t.Fatalf("GRPCRequests{IsActive} = %v, want 2", got)
 	}
+	if got := testutil.ToFloat64(m.StreamErrors); got != 3 {
+		t.Fatalf("StreamErrors = %v, want 3", got)
+	}
 }
 
 func TestMetricsNilIsSafe(t *testing.T) {
@@ -36,6 +42,7 @@ func TestMetricsNilIsSafe(t *testing.T) {
 	m.IncQueryError("kv")
 	m.SetSaturation("ns", "obj", 1)
 	m.IncGRPCRequest("IsActive")
+	m.IncStreamError()
 	if m.Registry() != nil {
 		t.Fatal("expected a nil *Metrics to return a nil registry")
 	}
