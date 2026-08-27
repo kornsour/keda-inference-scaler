@@ -59,6 +59,26 @@ func TestParseOverridesFromMetadata(t *testing.T) {
 	}
 }
 
+func TestParseTreatMissingAsErrorDefaultsFalse(t *testing.T) {
+	c, err := Parse(map[string]string{"prometheusAddress": "http://p:9090"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.TreatMissingAsError {
+		t.Fatalf("expected TreatMissingAsError to default to false, got %v", c.TreatMissingAsError)
+	}
+}
+
+func TestParseTreatMissingAsErrorTrue(t *testing.T) {
+	c, err := Parse(map[string]string{"prometheusAddress": "http://p:9090", "treatMissingAsError": "true"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !c.TreatMissingAsError {
+		t.Fatal("expected treatMissingAsError=true to be parsed")
+	}
+}
+
 func TestParseIgnoresUnparsableThreshold(t *testing.T) {
 	c, err := Parse(map[string]string{"prometheusAddress": "http://p:9090", "queueThreshold": "not-a-number"})
 	if err != nil {

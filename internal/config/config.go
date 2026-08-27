@@ -24,6 +24,12 @@ type Config struct {
 	QueueThreshold float64
 	KVThreshold    float64
 	Activation     float64
+
+	// TreatMissingAsError makes an absent metric series surface as an error
+	// instead of being read as idle (0). This matters because "absent" and
+	// "idle" are otherwise indistinguishable: a dropped PodMonitor or a
+	// relabel change looks exactly like no traffic.
+	TreatMissingAsError bool
 }
 
 // Parse builds a Config from a KEDA ScaledObjectRef's ScalerMetadata map, applying
@@ -49,6 +55,7 @@ func Parse(m map[string]string) (Config, error) {
 	c.QueueThreshold = floatOr(m["queueThreshold"], c.QueueThreshold)
 	c.KVThreshold = floatOr(m["kvCacheThreshold"], c.KVThreshold)
 	c.Activation = floatOr(m["activationThreshold"], c.Activation)
+	c.TreatMissingAsError = boolOr(m["treatMissingAsError"], false)
 	return c, nil
 }
 
@@ -58,6 +65,16 @@ func floatOr(s string, def float64) float64 {
 	}
 	if f, err := strconv.ParseFloat(s, 64); err == nil {
 		return f
+	}
+	return def
+}
+
+func boolOr(s string, def bool) bool {
+	if s == "" {
+		return def
+	}
+	if b, err := strconv.ParseBool(s); err == nil {
+		return b
 	}
 	return def
 }

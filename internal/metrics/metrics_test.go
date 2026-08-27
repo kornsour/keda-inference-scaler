@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -29,18 +30,15 @@ func TestInstantParsesScalar(t *testing.T) {
 	}
 }
 
-func TestInstantEmptyResultIsZero(t *testing.T) {
+func TestInstantEmptyResultIsErrMissing(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
 	}))
 	defer srv.Close()
 	p := &Prometheus{HTTP: srv.Client()}
 	v, err := p.Instant(context.Background(), srv.URL, "q")
-	if err != nil {
-		t.Fatalf("Instant: %v", err)
-	}
-	if v != 0 {
-		t.Fatalf("expected 0 for empty result, got %.2f", v)
+	if !errors.Is(err, ErrMissing) {
+		t.Fatalf("expected ErrMissing, got value=%.2f err=%v", v, err)
 	}
 }
 

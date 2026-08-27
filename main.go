@@ -19,6 +19,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -44,14 +45,29 @@ type scaler struct {
 
 // saturationFor resolves c's queue and KV-cache readings from s.source and
 // combines them into the composite saturation score.
+//
+// A query whose series is absent from the metric backend (metrics.ErrMissing)
+// reads as 0 by default — the same as an idle metric — unless
+// c.TreatMissingAsError is set, in which case it's surfaced as an error
+// instead of silently scoring 0. This matters because "absent" and "idle" are
+// otherwise indistinguishable: a dropped PodMonitor or a relabel change looks
+// exactly like no traffic.
 func (s *scaler) saturationFor(ctx context.Context, c config.Config) (float64, error) {
 	queue, err := s.source.Instant(ctx, c.PromAddr, c.QueueQuery)
 	if err != nil {
-		return 0, fmt.Errorf("queue query: %w", err)
+		if errors.Is(err, metrics.ErrMissing) && !c.TreatMissingAsError {
+			queue = 0
+		} else {
+			return 0, fmt.Errorf("queue query: %w", err)
+		}
 	}
 	kv, err := s.source.Instant(ctx, c.PromAddr, c.KVQuery)
 	if err != nil {
-		return 0, fmt.Errorf("kv-cache query: %w", err)
+		if errors.Is(err, metrics.ErrMissing) && !c.TreatMissingAsError {
+			kv = 0
+		} else {
+			return 0, fmt.Errorf("kv-cache query: %w", err)
+		}
 	}
 	return saturation.Score(queue, c.QueueThreshold, kv, c.KVThreshold), nil
 }
