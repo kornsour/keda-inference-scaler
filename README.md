@@ -72,9 +72,24 @@ kubectl get scaledobject,hpa -n inference
 | `queueThreshold` | `3` | queue depth that counts as "at threshold" |
 | `kvCacheThreshold` | `0.7` | KV-cache fraction that counts as "at threshold" |
 | `activationThreshold` | `1` | saturation below which the target may scale to zero |
+| `treatMissingAsError` | `false` | see below |
 
 The default queries use vLLM's metric names; override them for other engines that expose
 queue-depth / KV-cache equivalents.
+
+### Absent metric vs. idle system
+
+If a query's series isn't in the Prometheus result at all — the metric hasn't appeared yet,
+a relabel dropped it, a PodMonitor was removed, a job got renamed — that's indistinguishable
+from a genuinely idle system unless you say otherwise: **by default (`treatMissingAsError:
+false`), an absent series scores `0` for that dimension**, same as a real, observed zero.
+With `minReplicaCount: 1` this is harmless. With scale-to-zero, it means serving can sit at
+zero replicas indefinitely while requests queue, because the scaler can't tell "no load" from
+"no data."
+
+Set `treatMissingAsError: "true"` to fail loud instead: `IsActive`/`GetMetrics` return an
+error (visible in the scaler's logs and KEDA's) whenever either query's series is absent,
+rather than silently reporting saturation `0`.
 
 ## Archive
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -10,6 +11,16 @@ import (
 	pb "github.com/kornsour/keda-inference-scaler/externalscaler"
 	"google.golang.org/grpc/metadata"
 )
+
+// fakeEmptyProm returns a Prometheus /query response with an empty result set,
+// as if the queried series doesn't currently exist.
+func fakeEmptyProm(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
+	}))
+}
 
 // fakeProm returns a Prometheus /query response with the given scalar value
 // for every query.
@@ -174,22 +185,20 @@ func TestPromInstantErrorPaths(t *testing.T) {
 		}
 	})
 
-	t.Run("numeric value[1] falls back to zero", func(t *testing.T) {
+	t.Run("undecodable value[1] reads as metric missing", func(t *testing.T) {
 		// Prometheus always encodes the sample value as a JSON string, but
 		// promInstant only type-asserts — a well-formed response whose
-		// value[1] decodes as a number (not a string) currently falls back
-		// to 0 rather than erroring. Pin that behavior.
+		// value[1] decodes as a number (not a string) is treated the same as
+		// an absent series: errMetricMissing, not a silent fallback to 0.
+		// Pin that behavior.
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[0,42]}]}}`))
 		}))
 		defer srv.Close()
 		s := &scaler{http: srv.Client()}
 		v, err := s.promInstant(context.Background(), srv.URL, "q")
-		if err != nil {
-			t.Fatalf("promInstant: %v", err)
-		}
-		if v != 0 {
-			t.Fatalf("expected fallback to 0 for non-string value, got %.2f", v)
+		if !errors.Is(err, errMetricMissing) {
+			t.Fatalf("expected errMetricMissing for non-string value, got value=%.2f err=%v", v, err)
 		}
 	})
 
@@ -201,18 +210,39 @@ func TestPromInstantErrorPaths(t *testing.T) {
 	})
 }
 
-func TestEmptyResultIsZero(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
-	}))
+func TestEmptyResultIsMetricMissing(t *testing.T) {
+	srv := fakeEmptyProm(t)
 	defer srv.Close()
 	s := &scaler{http: srv.Client()}
 	v, err := s.promInstant(context.Background(), srv.URL, "q")
-	if err != nil {
-		t.Fatalf("promInstant: %v", err)
+	if !errors.Is(err, errMetricMissing) {
+		t.Fatalf("expected errMetricMissing, got value=%.2f err=%v", v, err)
 	}
-	if v != 0 {
-		t.Fatalf("expected 0 for empty result, got %.2f", v)
+}
+
+func TestMissingSeriesReadsAsIdleByDefault(t *testing.T) {
+	srv := fakeEmptyProm(t)
+	defer srv.Close()
+	s := &scaler{http: srv.Client()}
+	c := config{promAddr: srv.URL, queueQuery: "q", kvQuery: "kv", queueThreshold: 3, kvThreshold: 0.7}
+
+	got, err := s.saturation(context.Background(), c)
+	if err != nil {
+		t.Fatalf("expected no error with treatMissingAsError=false, got: %v", err)
+	}
+	if got != 0 {
+		t.Fatalf("expected saturation 0 for an absent series, got %.2f", got)
+	}
+}
+
+func TestMissingSeriesErrorsWhenConfigured(t *testing.T) {
+	srv := fakeEmptyProm(t)
+	defer srv.Close()
+	s := &scaler{http: srv.Client()}
+	c := config{promAddr: srv.URL, queueQuery: "q", kvQuery: "kv", queueThreshold: 3, kvThreshold: 0.7, treatMissingAsError: true}
+
+	if _, err := s.saturation(context.Background(), c); err == nil {
+		t.Fatal("expected an error with treatMissingAsError=true and an absent series")
 	}
 }
 
@@ -244,6 +274,24 @@ func TestParseConfigDefaults(t *testing.T) {
 func TestParseConfigRequiresPromAddr(t *testing.T) {
 	if _, err := parseConfig(map[string]string{}); err == nil {
 		t.Fatal("expected error when prometheusAddress is missing")
+	}
+	c, err := parseConfig(map[string]string{"prometheusAddress": "http://p:9090", "queueThreshold": "5"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.queueThreshold != 5 {
+		t.Fatalf("queueThreshold not parsed: %v", c.queueThreshold)
+	}
+	if c.treatMissingAsError != false {
+		t.Fatalf("expected treatMissingAsError to default to false, got %v", c.treatMissingAsError)
+	}
+
+	c2, err := parseConfig(map[string]string{"prometheusAddress": "http://p:9090", "treatMissingAsError": "true"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !c2.treatMissingAsError {
+		t.Fatal("expected treatMissingAsError=true to be parsed")
 	}
 }
 

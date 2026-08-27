@@ -15,6 +15,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -46,12 +47,13 @@ type scaler struct {
 }
 
 type config struct {
-	promAddr       string
-	queueQuery     string
-	kvQuery        string
-	queueThreshold float64
-	kvThreshold    float64
-	activation     float64
+	promAddr            string
+	queueQuery          string
+	kvQuery             string
+	queueThreshold      float64
+	kvThreshold         float64
+	activation          float64
+	treatMissingAsError bool
 }
 
 func parseConfig(m map[string]string) (config, error) {
@@ -75,6 +77,7 @@ func parseConfig(m map[string]string) (config, error) {
 	c.queueThreshold = floatOr(m["queueThreshold"], c.queueThreshold)
 	c.kvThreshold = floatOr(m["kvCacheThreshold"], c.kvThreshold)
 	c.activation = floatOr(m["activationThreshold"], c.activation)
+	c.treatMissingAsError = boolOr(m["treatMissingAsError"], false)
 	return c, nil
 }
 
@@ -88,8 +91,26 @@ func floatOr(s string, def float64) float64 {
 	return def
 }
 
-// promInstant runs an instant query and returns the first scalar value (0 if the
-// result set is empty — e.g. the metric hasn't appeared yet).
+func boolOr(s string, def bool) bool {
+	if s == "" {
+		return def
+	}
+	if b, err := strconv.ParseBool(s); err == nil {
+		return b
+	}
+	return def
+}
+
+// errMetricMissing indicates a Prometheus instant query returned no series at
+// all, or a series whose value wasn't decodable — i.e. the metric is absent
+// from Prometheus right now, as opposed to present with a real numeric value
+// (including 0). Callers decide whether that counts as "idle" or as an error;
+// see config.treatMissingAsError.
+var errMetricMissing = errors.New("metric series absent from prometheus result")
+
+// promInstant runs an instant query and returns the first scalar value. If the
+// result set is empty or the value isn't decodable, it returns errMetricMissing
+// (e.g. the metric hasn't appeared yet, or its series was dropped/renamed).
 func (s *scaler) promInstant(ctx context.Context, addr, query string) (float64, error) {
 	u := fmt.Sprintf("%s/api/v1/query?query=%s", addr, url.QueryEscape(query))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -115,24 +136,38 @@ func (s *scaler) promInstant(ctx context.Context, addr, query string) (float64, 
 		return 0, err
 	}
 	if len(out.Data.Result) == 0 {
-		return 0, nil
+		return 0, errMetricMissing
 	}
 	str, ok := out.Data.Result[0].Value[1].(string)
 	if !ok {
-		return 0, nil
+		return 0, errMetricMissing
 	}
 	return strconv.ParseFloat(str, 64)
 }
 
 // saturation == max(queueDepth/queueThreshold, kvUtil/kvThreshold) * 100.
+//
+// A query whose series is absent from Prometheus (errMetricMissing) reads as
+// 0 by default — the same as an idle metric — unless c.treatMissingAsError is
+// set, in which case it's surfaced as an error instead of silently scoring 0.
+// This matters because "absent" and "idle" are otherwise indistinguishable:
+// a dropped PodMonitor or a relabel change looks exactly like no traffic.
 func (s *scaler) saturation(ctx context.Context, c config) (float64, error) {
 	queue, err := s.promInstant(ctx, c.promAddr, c.queueQuery)
 	if err != nil {
-		return 0, fmt.Errorf("queue query: %w", err)
+		if errors.Is(err, errMetricMissing) && !c.treatMissingAsError {
+			queue = 0
+		} else {
+			return 0, fmt.Errorf("queue query: %w", err)
+		}
 	}
 	kv, err := s.promInstant(ctx, c.promAddr, c.kvQuery)
 	if err != nil {
-		return 0, fmt.Errorf("kv-cache query: %w", err)
+		if errors.Is(err, errMetricMissing) && !c.treatMissingAsError {
+			kv = 0
+		} else {
+			return 0, fmt.Errorf("kv-cache query: %w", err)
+		}
 	}
 	var qScore, kvScore float64
 	if c.queueThreshold > 0 {
