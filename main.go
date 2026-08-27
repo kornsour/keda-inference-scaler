@@ -8,188 +8,81 @@
 // scaler queries both and scales on whichever is closer to its threshold, exposing
 // a single normalized "inference-saturation" metric (100 == exactly at threshold,
 // >100 == scale out). That composite can't be expressed as one PromQL trigger.
+//
+// main.go owns flag/env handling, the listener, gRPC registration, and the
+// ExternalScaler methods that glue together internal/config, internal/metrics,
+// and internal/saturation. See those packages for the config parsing, metric
+// source, and saturation math respectively.
 package main
 
 //go:generate protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative externalscaler/externalscaler.proto
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"math"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
-	"strconv"
 	"time"
+
+	"github.com/kornsour/keda-inference-scaler/internal/config"
+	"github.com/kornsour/keda-inference-scaler/internal/metrics"
+	"github.com/kornsour/keda-inference-scaler/internal/saturation"
 
 	pb "github.com/kornsour/keda-inference-scaler/externalscaler"
 	"google.golang.org/grpc"
 )
 
-const (
-	metricName  = "inference-saturation"
-	targetValue = 100.0 // KEDA keeps the metric at this value; 100 == at threshold
-
-	defaultQueueQuery     = "sum(vllm:num_requests_waiting)"
-	defaultKVCacheQuery   = "max(vllm:gpu_cache_usage_perc)"
-	defaultQueueThreshold = 3.0
-	defaultKVThreshold    = 0.7
-	defaultActivation     = 1.0
-)
+const metricName = "inference-saturation"
 
 type scaler struct {
 	pb.UnimplementedExternalScalerServer
-	http *http.Client
+	source metrics.Source
 }
 
-type config struct {
-	promAddr            string
-	queueQuery          string
-	kvQuery             string
-	queueThreshold      float64
-	kvThreshold         float64
-	activation          float64
-	treatMissingAsError bool
-}
-
-func parseConfig(m map[string]string) (config, error) {
-	c := config{
-		queueQuery:     defaultQueueQuery,
-		kvQuery:        defaultKVCacheQuery,
-		queueThreshold: defaultQueueThreshold,
-		kvThreshold:    defaultKVThreshold,
-		activation:     defaultActivation,
-	}
-	c.promAddr = m["prometheusAddress"]
-	if c.promAddr == "" {
-		return c, fmt.Errorf("scaler metadata: prometheusAddress is required")
-	}
-	if v := m["queueQuery"]; v != "" {
-		c.queueQuery = v
-	}
-	if v := m["kvCacheQuery"]; v != "" {
-		c.kvQuery = v
-	}
-	c.queueThreshold = floatOr(m["queueThreshold"], c.queueThreshold)
-	c.kvThreshold = floatOr(m["kvCacheThreshold"], c.kvThreshold)
-	c.activation = floatOr(m["activationThreshold"], c.activation)
-	c.treatMissingAsError = boolOr(m["treatMissingAsError"], false)
-	return c, nil
-}
-
-func floatOr(s string, def float64) float64 {
-	if s == "" {
-		return def
-	}
-	if f, err := strconv.ParseFloat(s, 64); err == nil {
-		return f
-	}
-	return def
-}
-
-func boolOr(s string, def bool) bool {
-	if s == "" {
-		return def
-	}
-	if b, err := strconv.ParseBool(s); err == nil {
-		return b
-	}
-	return def
-}
-
-// errMetricMissing indicates a Prometheus instant query returned no series at
-// all, or a series whose value wasn't decodable — i.e. the metric is absent
-// from Prometheus right now, as opposed to present with a real numeric value
-// (including 0). Callers decide whether that counts as "idle" or as an error;
-// see config.treatMissingAsError.
-var errMetricMissing = errors.New("metric series absent from prometheus result")
-
-// promInstant runs an instant query and returns the first scalar value. If the
-// result set is empty or the value isn't decodable, it returns errMetricMissing
-// (e.g. the metric hasn't appeared yet, or its series was dropped/renamed).
-func (s *scaler) promInstant(ctx context.Context, addr, query string) (float64, error) {
-	u := fmt.Sprintf("%s/api/v1/query?query=%s", addr, url.QueryEscape(query))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return 0, err
-	}
-	resp, err := s.http.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("prometheus %s returned %d", addr, resp.StatusCode)
-	}
-	var out struct {
-		Data struct {
-			Result []struct {
-				Value [2]any `json:"value"`
-			} `json:"result"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return 0, err
-	}
-	if len(out.Data.Result) == 0 {
-		return 0, errMetricMissing
-	}
-	str, ok := out.Data.Result[0].Value[1].(string)
-	if !ok {
-		return 0, errMetricMissing
-	}
-	return strconv.ParseFloat(str, 64)
-}
-
-// saturation == max(queueDepth/queueThreshold, kvUtil/kvThreshold) * 100.
+// saturationFor resolves c's queue and KV-cache readings from s.source and
+// combines them into the composite saturation score.
 //
-// A query whose series is absent from Prometheus (errMetricMissing) reads as
-// 0 by default — the same as an idle metric — unless c.treatMissingAsError is
-// set, in which case it's surfaced as an error instead of silently scoring 0.
-// This matters because "absent" and "idle" are otherwise indistinguishable:
-// a dropped PodMonitor or a relabel change looks exactly like no traffic.
-func (s *scaler) saturation(ctx context.Context, c config) (float64, error) {
-	queue, err := s.promInstant(ctx, c.promAddr, c.queueQuery)
+// A query whose series is absent from the metric backend (metrics.ErrMissing)
+// reads as 0 by default — the same as an idle metric — unless
+// c.TreatMissingAsError is set, in which case it's surfaced as an error
+// instead of silently scoring 0. This matters because "absent" and "idle" are
+// otherwise indistinguishable: a dropped PodMonitor or a relabel change looks
+// exactly like no traffic.
+func (s *scaler) saturationFor(ctx context.Context, c config.Config) (float64, error) {
+	queue, err := s.source.Instant(ctx, c.PromAddr, c.QueueQuery)
 	if err != nil {
-		if errors.Is(err, errMetricMissing) && !c.treatMissingAsError {
+		if errors.Is(err, metrics.ErrMissing) && !c.TreatMissingAsError {
 			queue = 0
 		} else {
 			return 0, fmt.Errorf("queue query: %w", err)
 		}
 	}
-	kv, err := s.promInstant(ctx, c.promAddr, c.kvQuery)
+	kv, err := s.source.Instant(ctx, c.PromAddr, c.KVQuery)
 	if err != nil {
-		if errors.Is(err, errMetricMissing) && !c.treatMissingAsError {
+		if errors.Is(err, metrics.ErrMissing) && !c.TreatMissingAsError {
 			kv = 0
 		} else {
 			return 0, fmt.Errorf("kv-cache query: %w", err)
 		}
 	}
-	var qScore, kvScore float64
-	if c.queueThreshold > 0 {
-		qScore = queue / c.queueThreshold
-	}
-	if c.kvThreshold > 0 {
-		kvScore = kv / c.kvThreshold
-	}
-	return math.Max(qScore, kvScore) * targetValue, nil
+	return saturation.Score(queue, c.QueueThreshold, kv, c.KVThreshold), nil
 }
 
 func (s *scaler) IsActive(ctx context.Context, ref *pb.ScaledObjectRef) (*pb.IsActiveResponse, error) {
-	c, err := parseConfig(ref.ScalerMetadata)
+	c, err := config.Parse(ref.ScalerMetadata)
 	if err != nil {
 		return nil, err
 	}
-	sat, err := s.saturation(ctx, c)
+	sat, err := s.saturationFor(ctx, c)
 	if err != nil {
 		log.Printf("IsActive %s/%s: %v", ref.Namespace, ref.Name, err)
 		return nil, err
 	}
-	active := sat > c.activation
+	active := sat > c.Activation
 	log.Printf("IsActive %s/%s saturation=%.1f active=%v", ref.Namespace, ref.Name, sat, active)
 	return &pb.IsActiveResponse{Result: active}, nil
 }
@@ -217,18 +110,18 @@ func (s *scaler) GetMetricSpec(context.Context, *pb.ScaledObjectRef) (*pb.GetMet
 	return &pb.GetMetricSpecResponse{
 		MetricSpecs: []*pb.MetricSpec{{
 			MetricName:      metricName,
-			TargetSize:      int64(targetValue),
-			TargetSizeFloat: targetValue,
+			TargetSize:      int64(saturation.TargetValue),
+			TargetSizeFloat: saturation.TargetValue,
 		}},
 	}, nil
 }
 
 func (s *scaler) GetMetrics(ctx context.Context, req *pb.GetMetricsRequest) (*pb.GetMetricsResponse, error) {
-	c, err := parseConfig(req.ScaledObjectRef.ScalerMetadata)
+	c, err := config.Parse(req.ScaledObjectRef.ScalerMetadata)
 	if err != nil {
 		return nil, err
 	}
-	sat, err := s.saturation(ctx, c)
+	sat, err := s.saturationFor(ctx, c)
 	if err != nil {
 		log.Printf("GetMetrics %s: %v", req.ScaledObjectRef.Namespace, err)
 		return nil, err
@@ -253,7 +146,8 @@ func main() {
 		log.Fatalf("listen %s: %v", addr, err)
 	}
 	srv := grpc.NewServer()
-	pb.RegisterExternalScalerServer(srv, &scaler{http: &http.Client{Timeout: 5 * time.Second}})
+	source := &metrics.Prometheus{HTTP: &http.Client{Timeout: 5 * time.Second}}
+	pb.RegisterExternalScalerServer(srv, &scaler{source: source})
 	log.Printf("keda-inference-scaler listening on %s", addr)
 	if err := srv.Serve(lis); err != nil {
 		log.Fatalf("serve: %v", err)
