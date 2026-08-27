@@ -3,232 +3,68 @@ package main
 import (
 	"context"
 	"errors"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/kornsour/keda-inference-scaler/internal/config"
+	"github.com/kornsour/keda-inference-scaler/internal/metrics"
+	"github.com/kornsour/keda-inference-scaler/internal/saturation"
 
 	pb "github.com/kornsour/keda-inference-scaler/externalscaler"
 	"google.golang.org/grpc/metadata"
 )
 
-// fakeEmptyProm returns a Prometheus /query response with an empty result set,
-// as if the queried series doesn't currently exist.
-func fakeEmptyProm(t *testing.T) *httptest.Server {
-	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
-	}))
+// fakeSource is a metrics.Source that returns canned values per query, with no
+// HTTP involved — exactly the point of depending on the Source interface. A
+// query listed in missing returns metrics.ErrMissing; a query listed in errs
+// returns that error, for tests that need a non-ErrMissing failure to
+// propagate.
+type fakeSource struct {
+	values  map[string]float64
+	missing map[string]bool
+	errs    map[string]error
 }
 
-// fakeProm returns a Prometheus /query response with the given scalar value
-// for every query.
-func fakeProm(t *testing.T, value string) *httptest.Server {
-	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[0,"` + value + `"]}]}}`))
-	}))
+func (f *fakeSource) Instant(_ context.Context, _, query string) (float64, error) {
+	if err, ok := f.errs[query]; ok {
+		return 0, err
+	}
+	if f.missing[query] {
+		return 0, metrics.ErrMissing
+	}
+	return f.values[query], nil
 }
 
-// fakePromByQuery dispatches on the `query` URL parameter so distinct
-// queue/kv queries can return distinct values, letting tests pin exactly
-// which dimension of the composite signal is driving the result.
-func fakePromByQuery(t *testing.T, values map[string]string) *httptest.Server {
-	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query().Get("query")
-		v, ok := values[q]
-		if !ok {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[0,"` + v + `"]}]}}`))
-	}))
-}
-
-func TestSaturationCompositeSignal(t *testing.T) {
-	tests := []struct {
-		name           string
-		queue          string
-		kv             string
-		queueThreshold float64
-		kvThreshold    float64
-		want           float64
-	}{
-		{
-			name:           "queue-dominant",
-			queue:          "6",
-			kv:             "0.1",
-			queueThreshold: 3,
-			kvThreshold:    0.7,
-			want:           200, // 6/3 = 2.0 -> 200, vs kv 0.1/0.7 ~= 14.3
-		},
-		{
-			name:           "kv-dominant",
-			queue:          "0",
-			kv:             "0.63",
-			queueThreshold: 3,
-			kvThreshold:    0.7,
-			want:           90, // kv 0.63/0.7 = 0.9 -> 90, vs queue 0
-		},
-		{
-			name:           "exactly at threshold",
-			queue:          "3",
-			kv:             "0",
-			queueThreshold: 3,
-			kvThreshold:    0.7,
-			want:           100,
-		},
-		{
-			name:           "both zero",
-			queue:          "0",
-			kv:             "0",
-			queueThreshold: 3,
-			kvThreshold:    0.7,
-			want:           0,
-		},
+func TestScalerSaturationForUsesConfiguredQueries(t *testing.T) {
+	s := &scaler{source: &fakeSource{values: map[string]float64{
+		"queue_q": 6,
+		"kv_q":    0.35,
+	}}}
+	c := config.Config{
+		PromAddr:       "unused",
+		QueueQuery:     "queue_q",
+		KVQuery:        "kv_q",
+		QueueThreshold: 3,
+		KVThreshold:    0.7,
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			srv := fakePromByQuery(t, map[string]string{
-				"queue_query": tt.queue,
-				"kv_query":    tt.kv,
-			})
-			defer srv.Close()
-			s := &scaler{http: srv.Client()}
-			c := config{
-				promAddr:       srv.URL,
-				queueQuery:     "queue_query",
-				kvQuery:        "kv_query",
-				queueThreshold: tt.queueThreshold,
-				kvThreshold:    tt.kvThreshold,
-			}
-			got, err := s.saturation(context.Background(), c)
-			if err != nil {
-				t.Fatalf("saturation: %v", err)
-			}
-			if got != tt.want {
-				t.Fatalf("saturation = %.4f, want %.4f", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestSaturationZeroThresholdGuards(t *testing.T) {
-	// Both thresholds zero must not divide by zero (and must not panic);
-	// both scores are skipped, so saturation is 0 regardless of the raw
-	// queue/kv values.
-	srv := fakePromByQuery(t, map[string]string{
-		"queue_query": "50",
-		"kv_query":    "0.9",
-	})
-	defer srv.Close()
-	s := &scaler{http: srv.Client()}
-	c := config{promAddr: srv.URL, queueQuery: "queue_query", kvQuery: "kv_query", queueThreshold: 0, kvThreshold: 0}
-	got, err := s.saturation(context.Background(), c)
+	// queue=6/3=2.0, kv=0.35/0.7=0.5 -> max is queue -> 200.
+	got, err := s.saturationFor(context.Background(), c)
 	if err != nil {
-		t.Fatalf("saturation: %v", err)
+		t.Fatalf("saturationFor: %v", err)
 	}
-	if got != 0 {
-		t.Fatalf("expected 0 with zero thresholds, got %.2f", got)
-	}
-
-	// Only the queue threshold is zero: the queue score is skipped (not
-	// NaN/Inf) and the kv score alone determines saturation.
-	c2 := config{promAddr: srv.URL, queueQuery: "queue_query", kvQuery: "kv_query", queueThreshold: 0, kvThreshold: 0.9}
-	got2, err := s.saturation(context.Background(), c2)
-	if err != nil {
-		t.Fatalf("saturation: %v", err)
-	}
-	if got2 != 100 {
-		t.Fatalf("expected 100 (kv 0.9/0.9), got %.2f", got2)
-	}
-}
-
-func TestSaturationQueryErrors(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer srv.Close()
-	s := &scaler{http: srv.Client()}
-	c := config{promAddr: srv.URL, queueQuery: "q", kvQuery: "kv", queueThreshold: 3, kvThreshold: 0.7}
-	if _, err := s.saturation(context.Background(), c); err == nil {
-		t.Fatal("expected error when the queue query fails")
-	}
-}
-
-func TestPromInstantErrorPaths(t *testing.T) {
-	t.Run("http 500", func(t *testing.T) {
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusInternalServerError)
-		}))
-		defer srv.Close()
-		s := &scaler{http: srv.Client()}
-		if _, err := s.promInstant(context.Background(), srv.URL, "q"); err == nil {
-			t.Fatal("expected error on HTTP 500")
-		}
-	})
-
-	t.Run("malformed json", func(t *testing.T) {
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			_, _ = w.Write([]byte(`{not valid json`))
-		}))
-		defer srv.Close()
-		s := &scaler{http: srv.Client()}
-		if _, err := s.promInstant(context.Background(), srv.URL, "q"); err == nil {
-			t.Fatal("expected error on malformed JSON")
-		}
-	})
-
-	t.Run("undecodable value[1] reads as metric missing", func(t *testing.T) {
-		// Prometheus always encodes the sample value as a JSON string, but
-		// promInstant only type-asserts — a well-formed response whose
-		// value[1] decodes as a number (not a string) is treated the same as
-		// an absent series: errMetricMissing, not a silent fallback to 0.
-		// Pin that behavior.
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[0,42]}]}}`))
-		}))
-		defer srv.Close()
-		s := &scaler{http: srv.Client()}
-		v, err := s.promInstant(context.Background(), srv.URL, "q")
-		if !errors.Is(err, errMetricMissing) {
-			t.Fatalf("expected errMetricMissing for non-string value, got value=%.2f err=%v", v, err)
-		}
-	})
-
-	t.Run("request construction error", func(t *testing.T) {
-		s := &scaler{http: http.DefaultClient}
-		if _, err := s.promInstant(context.Background(), "://bad-url", "q"); err == nil {
-			t.Fatal("expected error building the request for an invalid address")
-		}
-	})
-}
-
-func TestEmptyResultIsMetricMissing(t *testing.T) {
-	srv := fakeEmptyProm(t)
-	defer srv.Close()
-	s := &scaler{http: srv.Client()}
-	v, err := s.promInstant(context.Background(), srv.URL, "q")
-	if !errors.Is(err, errMetricMissing) {
-		t.Fatalf("expected errMetricMissing, got value=%.2f err=%v", v, err)
+	if got != 200 {
+		t.Fatalf("got %.2f, want 200", got)
 	}
 }
 
 func TestMissingSeriesReadsAsIdleByDefault(t *testing.T) {
-	srv := fakeEmptyProm(t)
-	defer srv.Close()
-	s := &scaler{http: srv.Client()}
-	c := config{promAddr: srv.URL, queueQuery: "q", kvQuery: "kv", queueThreshold: 3, kvThreshold: 0.7}
+	s := &scaler{source: &fakeSource{missing: map[string]bool{"queue_q": true, "kv_q": true}}}
+	c := config.Config{PromAddr: "unused", QueueQuery: "queue_q", KVQuery: "kv_q", QueueThreshold: 3, KVThreshold: 0.7}
 
-	got, err := s.saturation(context.Background(), c)
+	got, err := s.saturationFor(context.Background(), c)
 	if err != nil {
-		t.Fatalf("expected no error with treatMissingAsError=false, got: %v", err)
+		t.Fatalf("expected no error with TreatMissingAsError=false, got: %v", err)
 	}
 	if got != 0 {
 		t.Fatalf("expected saturation 0 for an absent series, got %.2f", got)
@@ -236,136 +72,24 @@ func TestMissingSeriesReadsAsIdleByDefault(t *testing.T) {
 }
 
 func TestMissingSeriesErrorsWhenConfigured(t *testing.T) {
-	srv := fakeEmptyProm(t)
-	defer srv.Close()
-	s := &scaler{http: srv.Client()}
-	c := config{promAddr: srv.URL, queueQuery: "q", kvQuery: "kv", queueThreshold: 3, kvThreshold: 0.7, treatMissingAsError: true}
+	s := &scaler{source: &fakeSource{missing: map[string]bool{"queue_q": true, "kv_q": true}}}
+	c := config.Config{PromAddr: "unused", QueueQuery: "queue_q", KVQuery: "kv_q", QueueThreshold: 3, KVThreshold: 0.7, TreatMissingAsError: true}
 
-	if _, err := s.saturation(context.Background(), c); err == nil {
-		t.Fatal("expected an error with treatMissingAsError=true and an absent series")
-	}
-}
-
-func TestParseConfigDefaults(t *testing.T) {
-	c, err := parseConfig(map[string]string{"prometheusAddress": "http://p:9090"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if c.promAddr != "http://p:9090" {
-		t.Fatalf("promAddr = %q", c.promAddr)
-	}
-	if c.queueQuery != defaultQueueQuery {
-		t.Fatalf("queueQuery = %q, want default %q", c.queueQuery, defaultQueueQuery)
-	}
-	if c.kvQuery != defaultKVCacheQuery {
-		t.Fatalf("kvQuery = %q, want default %q", c.kvQuery, defaultKVCacheQuery)
-	}
-	if c.queueThreshold != defaultQueueThreshold {
-		t.Fatalf("queueThreshold = %v, want default %v", c.queueThreshold, defaultQueueThreshold)
-	}
-	if c.kvThreshold != defaultKVThreshold {
-		t.Fatalf("kvThreshold = %v, want default %v", c.kvThreshold, defaultKVThreshold)
-	}
-	if c.activation != defaultActivation {
-		t.Fatalf("activation = %v, want default %v", c.activation, defaultActivation)
-	}
-}
-
-func TestParseConfigRequiresPromAddr(t *testing.T) {
-	if _, err := parseConfig(map[string]string{}); err == nil {
-		t.Fatal("expected error when prometheusAddress is missing")
-	}
-	c, err := parseConfig(map[string]string{"prometheusAddress": "http://p:9090", "queueThreshold": "5"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if c.queueThreshold != 5 {
-		t.Fatalf("queueThreshold not parsed: %v", c.queueThreshold)
-	}
-	if c.treatMissingAsError != false {
-		t.Fatalf("expected treatMissingAsError to default to false, got %v", c.treatMissingAsError)
-	}
-
-	c2, err := parseConfig(map[string]string{"prometheusAddress": "http://p:9090", "treatMissingAsError": "true"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !c2.treatMissingAsError {
-		t.Fatal("expected treatMissingAsError=true to be parsed")
-	}
-}
-
-func TestParseConfigAllSixMetadataKeys(t *testing.T) {
-	m := map[string]string{
-		"prometheusAddress":   "http://p:9090",
-		"queueQuery":          "custom_queue_query",
-		"kvCacheQuery":        "custom_kv_query",
-		"queueThreshold":      "5",
-		"kvCacheThreshold":    "0.42",
-		"activationThreshold": "10",
-	}
-	c, err := parseConfig(m)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if c.promAddr != "http://p:9090" {
-		t.Fatalf("promAddr = %q", c.promAddr)
-	}
-	if c.queueQuery != "custom_queue_query" {
-		t.Fatalf("queueQuery = %q", c.queueQuery)
-	}
-	if c.kvQuery != "custom_kv_query" {
-		t.Fatalf("kvQuery = %q", c.kvQuery)
-	}
-	if c.queueThreshold != 5 {
-		t.Fatalf("queueThreshold = %v", c.queueThreshold)
-	}
-	if c.kvThreshold != 0.42 {
-		t.Fatalf("kvThreshold = %v", c.kvThreshold)
-	}
-	if c.activation != 10 {
-		t.Fatalf("activation = %v", c.activation)
-	}
-}
-
-func TestFloatOr(t *testing.T) {
-	if got := floatOr("", 3); got != 3 {
-		t.Fatalf("floatOr empty string = %v, want default 3", got)
-	}
-	if got := floatOr("2.5", 3); got != 2.5 {
-		t.Fatalf("floatOr valid input = %v, want 2.5", got)
-	}
-	// Unparseable input silently falls back to the default rather than
-	// erroring or propagating; pin the current behavior explicitly since
-	// it's easy to accidentally "fix" without noticing it's user-facing.
-	if got := floatOr("abc", 3); got != 3 {
-		t.Fatalf("floatOr unparseable input = %v, want fallback default 3", got)
-	}
-}
-
-func TestParseConfigUnparseableThresholdFallsBackToDefault(t *testing.T) {
-	c, err := parseConfig(map[string]string{
-		"prometheusAddress": "http://p:9090",
-		"queueThreshold":    "abc",
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if c.queueThreshold != defaultQueueThreshold {
-		t.Fatalf("queueThreshold = %v, want silent fallback to default %v", c.queueThreshold, defaultQueueThreshold)
+	if _, err := s.saturationFor(context.Background(), c); err == nil {
+		t.Fatal("expected an error with TreatMissingAsError=true and an absent series")
 	}
 }
 
 func TestIsActive(t *testing.T) {
 	t.Run("below activation threshold", func(t *testing.T) {
-		srv := fakeProm(t, "0")
-		defer srv.Close()
-		s := &scaler{http: srv.Client()}
+		s := &scaler{source: &fakeSource{values: map[string]float64{"queue_q": 0, "kv_q": 0}}}
 		ref := &pb.ScaledObjectRef{
 			Namespace: "ns",
 			Name:      "obj",
 			ScalerMetadata: map[string]string{
-				"prometheusAddress":   srv.URL,
+				"prometheusAddress":   "unused",
+				"queueQuery":          "queue_q",
+				"kvCacheQuery":        "kv_q",
 				"activationThreshold": "1",
 			},
 		}
@@ -381,14 +105,14 @@ func TestIsActive(t *testing.T) {
 	t.Run("above activation threshold", func(t *testing.T) {
 		// queue=6, threshold=3 -> saturation 200, well above the default
 		// activation threshold of 1.
-		srv := fakeProm(t, "6")
-		defer srv.Close()
-		s := &scaler{http: srv.Client()}
+		s := &scaler{source: &fakeSource{values: map[string]float64{"queue_q": 6, "kv_q": 0}}}
 		ref := &pb.ScaledObjectRef{
 			Namespace: "ns",
 			Name:      "obj",
 			ScalerMetadata: map[string]string{
-				"prometheusAddress": srv.URL,
+				"prometheusAddress": "unused",
+				"queueQuery":        "queue_q",
+				"kvCacheQuery":      "kv_q",
 			},
 		}
 		resp, err := s.IsActive(context.Background(), ref)
@@ -401,19 +125,19 @@ func TestIsActive(t *testing.T) {
 	})
 
 	t.Run("invalid config", func(t *testing.T) {
-		s := &scaler{http: http.DefaultClient}
+		s := &scaler{}
 		if _, err := s.IsActive(context.Background(), &pb.ScaledObjectRef{ScalerMetadata: map[string]string{}}); err == nil {
 			t.Fatal("expected error when prometheusAddress is missing")
 		}
 	})
 
 	t.Run("query error propagates", func(t *testing.T) {
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusInternalServerError)
-		}))
-		defer srv.Close()
-		s := &scaler{http: srv.Client()}
-		ref := &pb.ScaledObjectRef{ScalerMetadata: map[string]string{"prometheusAddress": srv.URL}}
+		s := &scaler{source: &fakeSource{errs: map[string]error{"queue_q": errors.New("boom")}}}
+		ref := &pb.ScaledObjectRef{ScalerMetadata: map[string]string{
+			"prometheusAddress": "unused",
+			"queueQuery":        "queue_q",
+			"kvCacheQuery":      "kv_q",
+		}}
 		if _, err := s.IsActive(context.Background(), ref); err == nil {
 			t.Fatal("expected error to propagate from a failing query")
 		}
@@ -433,11 +157,11 @@ func TestGetMetricSpec(t *testing.T) {
 	if spec.MetricName != metricName {
 		t.Fatalf("MetricName = %q, want %q", spec.MetricName, metricName)
 	}
-	if spec.TargetSize != int64(targetValue) {
-		t.Fatalf("TargetSize = %d, want %d", spec.TargetSize, int64(targetValue))
+	if spec.TargetSize != int64(saturation.TargetValue) {
+		t.Fatalf("TargetSize = %d, want %d", spec.TargetSize, int64(saturation.TargetValue))
 	}
-	if spec.TargetSizeFloat != targetValue {
-		t.Fatalf("TargetSizeFloat = %v, want %v", spec.TargetSizeFloat, targetValue)
+	if spec.TargetSizeFloat != saturation.TargetValue {
+		t.Fatalf("TargetSizeFloat = %v, want %v", spec.TargetSizeFloat, saturation.TargetValue)
 	}
 }
 
@@ -445,16 +169,19 @@ func TestGetMetrics(t *testing.T) {
 	// queue=2.72, threshold=3 -> qScore=0.90666..., saturation=90.666...
 	// (kv is 0, so it never dominates). math.Round should push the integer
 	// MetricValue to 91 while the float field keeps the unrounded value.
-	srv := fakePromByQuery(t, map[string]string{
-		defaultQueueQuery:   "2.72",
-		defaultKVCacheQuery: "0",
-	})
-	defer srv.Close()
-	s := &scaler{http: srv.Client()}
+	s := &scaler{source: &fakeSource{values: map[string]float64{
+		"queue_q": 2.72,
+		"kv_q":    0,
+	}}}
 	req := &pb.GetMetricsRequest{
 		ScaledObjectRef: &pb.ScaledObjectRef{
-			Namespace:      "ns",
-			ScalerMetadata: map[string]string{"prometheusAddress": srv.URL, "queueThreshold": "3"},
+			Namespace: "ns",
+			ScalerMetadata: map[string]string{
+				"prometheusAddress": "unused",
+				"queueQuery":        "queue_q",
+				"kvCacheQuery":      "kv_q",
+				"queueThreshold":    "3",
+			},
 		},
 	}
 	resp, err := s.GetMetrics(context.Background(), req)
@@ -468,7 +195,7 @@ func TestGetMetrics(t *testing.T) {
 	if mv.MetricName != metricName {
 		t.Fatalf("MetricName = %q, want %q", mv.MetricName, metricName)
 	}
-	wantFloat := (2.72 / 3.0) * targetValue
+	wantFloat := (2.72 / 3.0) * saturation.TargetValue
 	if diff := mv.MetricValueFloat - wantFloat; diff > 1e-9 || diff < -1e-9 {
 		t.Fatalf("MetricValueFloat = %v, want %v", mv.MetricValueFloat, wantFloat)
 	}
@@ -477,7 +204,7 @@ func TestGetMetrics(t *testing.T) {
 	}
 
 	t.Run("invalid config", func(t *testing.T) {
-		s := &scaler{http: http.DefaultClient}
+		s := &scaler{}
 		req := &pb.GetMetricsRequest{ScaledObjectRef: &pb.ScaledObjectRef{ScalerMetadata: map[string]string{}}}
 		if _, err := s.GetMetrics(context.Background(), req); err == nil {
 			t.Fatal("expected error when prometheusAddress is missing")
@@ -485,12 +212,12 @@ func TestGetMetrics(t *testing.T) {
 	})
 
 	t.Run("query error propagates", func(t *testing.T) {
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusInternalServerError)
-		}))
-		defer srv.Close()
-		s := &scaler{http: srv.Client()}
-		req := &pb.GetMetricsRequest{ScaledObjectRef: &pb.ScaledObjectRef{ScalerMetadata: map[string]string{"prometheusAddress": srv.URL}}}
+		s := &scaler{source: &fakeSource{errs: map[string]error{"queue_q": errors.New("boom")}}}
+		req := &pb.GetMetricsRequest{ScaledObjectRef: &pb.ScaledObjectRef{ScalerMetadata: map[string]string{
+			"prometheusAddress": "unused",
+			"queueQuery":        "queue_q",
+			"kvCacheQuery":      "kv_q",
+		}}}
 		if _, err := s.GetMetrics(context.Background(), req); err == nil {
 			t.Fatal("expected error to propagate from a failing query")
 		}
@@ -524,10 +251,12 @@ func TestStreamIsActiveSendsOnEachTick(t *testing.T) {
 	streamIsActiveInterval = 5 * time.Millisecond
 	defer func() { streamIsActiveInterval = orig }()
 
-	srv := fakeProm(t, "6") // saturation 200, active
-	defer srv.Close()
-	s := &scaler{http: srv.Client()}
-	ref := &pb.ScaledObjectRef{ScalerMetadata: map[string]string{"prometheusAddress": srv.URL}}
+	s := &scaler{source: &fakeSource{values: map[string]float64{"queue_q": 6, "kv_q": 0}}} // saturation 200, active
+	ref := &pb.ScaledObjectRef{ScalerMetadata: map[string]string{
+		"prometheusAddress": "unused",
+		"queueQuery":        "queue_q",
+		"kvCacheQuery":      "kv_q",
+	}}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	fs := &fakeStreamServer{ctx: ctx, sent: make(chan *pb.IsActiveResponse, 1)}
@@ -560,8 +289,8 @@ func TestStreamIsActiveReturnsImmediatelyWhenContextDone(t *testing.T) {
 	streamIsActiveInterval = time.Hour // long enough that only ctx.Done() can end the test
 	defer func() { streamIsActiveInterval = orig }()
 
-	s := &scaler{http: http.DefaultClient}
-	ref := &pb.ScaledObjectRef{ScalerMetadata: map[string]string{"prometheusAddress": "http://unused"}}
+	s := &scaler{}
+	ref := &pb.ScaledObjectRef{ScalerMetadata: map[string]string{"prometheusAddress": "unused"}}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -585,12 +314,12 @@ func TestStreamIsActiveSkipsSendOnQueryError(t *testing.T) {
 	streamIsActiveInterval = 5 * time.Millisecond
 	defer func() { streamIsActiveInterval = orig }()
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer srv.Close()
-	s := &scaler{http: srv.Client()}
-	ref := &pb.ScaledObjectRef{ScalerMetadata: map[string]string{"prometheusAddress": srv.URL}}
+	s := &scaler{source: &fakeSource{errs: map[string]error{"queue_q": errors.New("boom")}}}
+	ref := &pb.ScaledObjectRef{ScalerMetadata: map[string]string{
+		"prometheusAddress": "unused",
+		"queueQuery":        "queue_q",
+		"kvCacheQuery":      "kv_q",
+	}}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	fs := &fakeStreamServer{ctx: ctx, sent: make(chan *pb.IsActiveResponse, 1)}
