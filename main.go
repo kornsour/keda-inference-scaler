@@ -77,9 +77,9 @@ func newScaler(source metrics.Source) *scaler {
 // having answered for readiness purposes -- it just also counts as a query
 // error, since it's the case operators most want visibility into (a dropped
 // PodMonitor looks exactly like an idle system otherwise).
-func (s *scaler) queryInstant(ctx context.Context, dimension, addr, query string, ttl time.Duration) (float64, error) {
+func (s *scaler) queryInstant(ctx context.Context, dimension, addr, query string, ttl time.Duration) (metrics.Sample, error) {
 	start := time.Now()
-	v, err := s.cache.Get(ctx, addr, query, ttl)
+	sample, err := s.cache.Get(ctx, addr, query, ttl)
 	s.metrics.ObserveQueryDuration(dimension, time.Since(start))
 	switch {
 	case err == nil:
@@ -90,7 +90,24 @@ func (s *scaler) queryInstant(ctx context.Context, dimension, addr, query string
 	default:
 		s.metrics.IncQueryError(dimension)
 	}
-	return v, err
+	return sample, err
+}
+
+// saturationResult is what saturationFor resolves for one ScaledObject: the
+// composite score, plus how stale each input behind it already was at the
+// moment the decision was made. Every decision this scaler makes is a
+// function of samples that were true at some point in the past, not now --
+// QueueAge/KVAge make that lag a number instead of something inferred from
+// the configured intervals.
+//
+// An age of 0 also covers the case where its dimension didn't return a real
+// sample at all (metrics.ErrMissing, not treated as an error): "absent" and
+// "perfectly fresh" are otherwise indistinguishable from the age alone, the
+// same ambiguity c.TreatMissingAsError exists to resolve for the value.
+type saturationResult struct {
+	Score    float64
+	QueueAge time.Duration
+	KVAge    time.Duration
 }
 
 // saturationFor resolves c's queue and KV-cache readings and combines them
@@ -100,7 +117,9 @@ func (s *scaler) queryInstant(ctx context.Context, dimension, addr, query string
 // max(queue, kv) rather than queue+kv, and a hard failure in either cancels
 // the other. Both go through s.cache, so repeated calls within c.CacheTTL are
 // served from cache rather than re-querying Prometheus, and concurrent
-// identical queries collapse into one upstream request.
+// identical queries collapse into one upstream request. A cache hit carries
+// forward the original Prometheus sample's timestamp (see CachingSource.Get),
+// so the reported age keeps growing across cache hits rather than resetting.
 //
 // A query whose series is absent from the metric backend (metrics.ErrMissing)
 // reads as 0 by default — the same as an idle metric — unless
@@ -108,36 +127,43 @@ func (s *scaler) queryInstant(ctx context.Context, dimension, addr, query string
 // instead of silently scoring 0. This matters because "absent" and "idle" are
 // otherwise indistinguishable: a dropped PodMonitor or a relabel change looks
 // exactly like no traffic.
-func (s *scaler) saturationFor(ctx context.Context, c config.Config) (float64, error) {
+func (s *scaler) saturationFor(ctx context.Context, c config.Config) (saturationResult, error) {
 	g, gctx := errgroup.WithContext(ctx)
 
 	var queue, kv float64
+	var queueAge, kvAge time.Duration
 	g.Go(func() error {
-		v, err := s.queryInstant(gctx, "queue", c.PromAddr, c.QueueQuery, c.CacheTTL)
+		sample, err := s.queryInstant(gctx, "queue", c.PromAddr, c.QueueQuery, c.CacheTTL)
 		if err != nil {
 			if errors.Is(err, metrics.ErrMissing) && !c.TreatMissingAsError {
 				return nil
 			}
 			return fmt.Errorf("queue query: %w", err)
 		}
-		queue = v
+		queue = sample.Value
+		queueAge = time.Since(sample.Time)
 		return nil
 	})
 	g.Go(func() error {
-		v, err := s.queryInstant(gctx, "kv", c.PromAddr, c.KVQuery, c.CacheTTL)
+		sample, err := s.queryInstant(gctx, "kv", c.PromAddr, c.KVQuery, c.CacheTTL)
 		if err != nil {
 			if errors.Is(err, metrics.ErrMissing) && !c.TreatMissingAsError {
 				return nil
 			}
 			return fmt.Errorf("kv-cache query: %w", err)
 		}
-		kv = v
+		kv = sample.Value
+		kvAge = time.Since(sample.Time)
 		return nil
 	})
 	if err := g.Wait(); err != nil {
-		return 0, err
+		return saturationResult{}, err
 	}
-	return saturation.Score(queue, c.QueueThreshold, kv, c.KVThreshold), nil
+	return saturationResult{
+		Score:    saturation.Score(queue, c.QueueThreshold, kv, c.KVThreshold),
+		QueueAge: queueAge,
+		KVAge:    kvAge,
+	}, nil
 }
 
 func (s *scaler) IsActive(ctx context.Context, ref *pb.ScaledObjectRef) (*pb.IsActiveResponse, error) {
@@ -147,14 +173,17 @@ func (s *scaler) IsActive(ctx context.Context, ref *pb.ScaledObjectRef) (*pb.IsA
 		slog.Error("IsActive: invalid config", "namespace", ref.Namespace, "name", ref.Name, "error", err)
 		return nil, err
 	}
-	sat, err := s.saturationFor(ctx, c)
+	res, err := s.saturationFor(ctx, c)
 	if err != nil {
 		slog.Error("IsActive", "namespace", ref.Namespace, "name", ref.Name, "error", err)
 		return nil, err
 	}
-	s.metrics.SetSaturation(ref.Namespace, ref.Name, sat)
-	active := sat > c.Activation
-	slog.Info("IsActive", "namespace", ref.Namespace, "name", ref.Name, "saturation", sat, "active", active)
+	s.metrics.SetSaturation(ref.Namespace, ref.Name, res.Score)
+	s.metrics.SetSignalAge(ref.Namespace, ref.Name, "queue", res.QueueAge)
+	s.metrics.SetSignalAge(ref.Namespace, ref.Name, "kv", res.KVAge)
+	active := res.Score > c.Activation
+	slog.Info("IsActive", "namespace", ref.Namespace, "name", ref.Name, "saturation", res.Score, "active", active,
+		"queueSignalAgeSeconds", res.QueueAge.Seconds(), "kvSignalAgeSeconds", res.KVAge.Seconds())
 	return &pb.IsActiveResponse{Result: active}, nil
 }
 
@@ -245,18 +274,21 @@ func (s *scaler) GetMetrics(ctx context.Context, req *pb.GetMetricsRequest) (*pb
 		slog.Error("GetMetrics: invalid config", "namespace", req.ScaledObjectRef.Namespace, "name", req.ScaledObjectRef.Name, "error", err)
 		return nil, err
 	}
-	sat, err := s.saturationFor(ctx, c)
+	res, err := s.saturationFor(ctx, c)
 	if err != nil {
 		slog.Error("GetMetrics", "namespace", req.ScaledObjectRef.Namespace, "name", req.ScaledObjectRef.Name, "error", err)
 		return nil, err
 	}
-	s.metrics.SetSaturation(req.ScaledObjectRef.Namespace, req.ScaledObjectRef.Name, sat)
-	slog.Info("GetMetrics", "namespace", req.ScaledObjectRef.Namespace, "name", req.ScaledObjectRef.Name, "saturation", sat)
+	s.metrics.SetSaturation(req.ScaledObjectRef.Namespace, req.ScaledObjectRef.Name, res.Score)
+	s.metrics.SetSignalAge(req.ScaledObjectRef.Namespace, req.ScaledObjectRef.Name, "queue", res.QueueAge)
+	s.metrics.SetSignalAge(req.ScaledObjectRef.Namespace, req.ScaledObjectRef.Name, "kv", res.KVAge)
+	slog.Info("GetMetrics", "namespace", req.ScaledObjectRef.Namespace, "name", req.ScaledObjectRef.Name, "saturation", res.Score,
+		"queueSignalAgeSeconds", res.QueueAge.Seconds(), "kvSignalAgeSeconds", res.KVAge.Seconds())
 	return &pb.GetMetricsResponse{
 		MetricValues: []*pb.MetricValue{{
 			MetricName:       metricName,
-			MetricValue:      int64(math.Round(sat)),
-			MetricValueFloat: sat,
+			MetricValue:      int64(math.Round(res.Score)),
+			MetricValueFloat: res.Score,
 		}},
 	}, nil
 }

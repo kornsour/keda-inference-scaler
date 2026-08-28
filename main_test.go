@@ -28,14 +28,14 @@ type fakeSource struct {
 	errs    map[string]error
 }
 
-func (f *fakeSource) Instant(_ context.Context, _, query string) (float64, error) {
+func (f *fakeSource) Instant(_ context.Context, _, query string) (metrics.Sample, error) {
 	if err, ok := f.errs[query]; ok {
-		return 0, err
+		return metrics.Sample{}, err
 	}
 	if f.missing[query] {
-		return 0, metrics.ErrMissing
+		return metrics.Sample{}, metrics.ErrMissing
 	}
-	return f.values[query], nil
+	return metrics.Sample{Value: f.values[query], Time: time.Now()}, nil
 }
 
 // slowSource is a metrics.Source whose Instant sleeps delay[query] before
@@ -46,9 +46,9 @@ type slowSource struct {
 	delay  map[string]time.Duration
 }
 
-func (s *slowSource) Instant(_ context.Context, _, query string) (float64, error) {
+func (s *slowSource) Instant(_ context.Context, _, query string) (metrics.Sample, error) {
 	time.Sleep(s.delay[query])
-	return s.values[query], nil
+	return metrics.Sample{Value: s.values[query], Time: time.Now()}, nil
 }
 
 func TestSaturationForQueriesConcurrently(t *testing.T) {
@@ -85,16 +85,16 @@ type cancelWatchingSource struct {
 	sawCancel  chan struct{} // closed if ctx.Done() fired for watchQuery
 }
 
-func (c *cancelWatchingSource) Instant(ctx context.Context, _, query string) (float64, error) {
+func (c *cancelWatchingSource) Instant(ctx context.Context, _, query string) (metrics.Sample, error) {
 	if query != c.watchQuery {
-		return 0, errors.New("boom")
+		return metrics.Sample{}, errors.New("boom")
 	}
 	select {
 	case <-c.release:
-		return 1, nil
+		return metrics.Sample{Value: 1, Time: time.Now()}, nil
 	case <-ctx.Done():
 		close(c.sawCancel)
-		return 0, ctx.Err()
+		return metrics.Sample{}, ctx.Err()
 	}
 }
 
@@ -140,8 +140,16 @@ func TestScalerSaturationForUsesConfiguredQueries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("saturationFor: %v", err)
 	}
-	if got != 200 {
-		t.Fatalf("got %.2f, want 200", got)
+	if got.Score != 200 {
+		t.Fatalf("got %.2f, want 200", got.Score)
+	}
+	// Both dimensions returned a real sample, so both ages should be
+	// reported, and should be small (queried moments ago, not stale).
+	if got.QueueAge < 0 || got.QueueAge > time.Second {
+		t.Fatalf("QueueAge = %v, want a small non-negative duration", got.QueueAge)
+	}
+	if got.KVAge < 0 || got.KVAge > time.Second {
+		t.Fatalf("KVAge = %v, want a small non-negative duration", got.KVAge)
 	}
 }
 
@@ -153,8 +161,14 @@ func TestMissingSeriesReadsAsIdleByDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected no error with TreatMissingAsError=false, got: %v", err)
 	}
-	if got != 0 {
-		t.Fatalf("expected saturation 0 for an absent series, got %.2f", got)
+	if got.Score != 0 {
+		t.Fatalf("expected saturation 0 for an absent series, got %.2f", got.Score)
+	}
+	// Neither dimension returned a real sample, so neither has a meaningful
+	// age -- both should read as the zero value rather than a bogus huge
+	// duration derived from a zero time.Time.
+	if got.QueueAge != 0 || got.KVAge != 0 {
+		t.Fatalf("expected zero signal age for an absent series, got queue=%v kv=%v", got.QueueAge, got.KVAge)
 	}
 }
 
@@ -528,11 +542,11 @@ func TestStreamIsActiveResetsFailureCountOnSuccess(t *testing.T) {
 	// countingSource's own mutex-guarded counter, so this closure stays safe
 	// to call concurrently from both queries without needing its own state.
 	src := &countingSource{
-		fn: func(n int) (float64, error) {
+		fn: func(n int) (metrics.Sample, error) {
 			if n <= 2 {
-				return 0, errors.New("boom")
+				return metrics.Sample{}, errors.New("boom")
 			}
-			return 0, nil
+			return metrics.Sample{Time: time.Now()}, nil
 		},
 	}
 	s := newScaler(src)
@@ -588,10 +602,10 @@ loop:
 type countingSource struct {
 	mu sync.Mutex
 	n  int
-	fn func(call int) (float64, error)
+	fn func(call int) (metrics.Sample, error)
 }
 
-func (c *countingSource) Instant(_ context.Context, _, _ string) (float64, error) {
+func (c *countingSource) Instant(_ context.Context, _, _ string) (metrics.Sample, error) {
 	c.mu.Lock()
 	c.n++
 	n := c.n
