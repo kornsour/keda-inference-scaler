@@ -37,7 +37,7 @@ type CachingSource struct {
 }
 
 type cacheEntry struct {
-	value     float64
+	sample    Sample
 	err       error
 	expiresAt time.Time
 }
@@ -54,47 +54,53 @@ func cacheKey(addr, query string) string {
 	return addr + "\x00" + query
 }
 
-// Get returns addr/query's value, serving it from cache when a reading
+// Get returns addr/query's sample, serving it from cache when a reading
 // younger than ttl is already on hand. ttl <= 0 disables caching for this
 // call -- the backend is always queried -- though concurrent identical calls
 // still collapse into one upstream request via singleflight.
+//
+// A cache hit returns the original Sample untouched, including its original
+// Sample.Time: that is what makes the cache itself a link in the staleness
+// chain rather than a reset of it -- a reading served from cache is exactly
+// as stale as it was at the moment it left Prometheus, plus however long it
+// has sat in the cache since.
 //
 // Only a successful result, or ErrMissing (an absent series is itself a
 // stable fact until Prometheus's next scrape), is written to the cache. Any
 // other error -- a transport failure, a non-200 response, a malformed body --
 // is never cached, so a transient upstream problem is retried on the very
 // next call instead of being pinned for the full TTL.
-func (c *CachingSource) Get(ctx context.Context, addr, query string, ttl time.Duration) (float64, error) {
+func (c *CachingSource) Get(ctx context.Context, addr, query string, ttl time.Duration) (Sample, error) {
 	key := cacheKey(addr, query)
 
 	if ttl > 0 {
-		if v, err, ok := c.load(key); ok {
-			return v, err
+		if s, err, ok := c.load(key); ok {
+			return s, err
 		}
 	}
 
 	res, err, _ := c.group.Do(key, func() (any, error) {
-		v, err := c.Source.Instant(ctx, addr, query)
+		s, err := c.Source.Instant(ctx, addr, query)
 		if ttl > 0 && (err == nil || errors.Is(err, ErrMissing)) {
-			c.store(key, v, err, ttl)
+			c.store(key, s, err, ttl)
 		}
-		return v, err
+		return s, err
 	})
-	return res.(float64), err
+	return res.(Sample), err
 }
 
-func (c *CachingSource) load(key string) (float64, error, bool) {
+func (c *CachingSource) load(key string) (Sample, error, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e, ok := c.cache[key]
 	if !ok || time.Now().After(e.expiresAt) {
-		return 0, nil, false
+		return Sample{}, nil, false
 	}
-	return e.value, e.err, true
+	return e.sample, e.err, true
 }
 
-func (c *CachingSource) store(key string, value float64, err error, ttl time.Duration) {
+func (c *CachingSource) store(key string, sample Sample, err error, ttl time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.cache[key] = cacheEntry{value: value, err: err, expiresAt: time.Now().Add(ttl)}
+	c.cache[key] = cacheEntry{sample: sample, err: err, expiresAt: time.Now().Add(ttl)}
 }

@@ -23,6 +23,7 @@ type Metrics struct {
 	QueryDuration *prometheus.HistogramVec
 	QueryErrors   *prometheus.CounterVec
 	Saturation    *prometheus.GaugeVec
+	SignalAge     *prometheus.GaugeVec
 	GRPCRequests  *prometheus.CounterVec
 	StreamErrors  prometheus.Counter
 
@@ -48,6 +49,12 @@ func NewMetrics() *Metrics {
 			Name: "scaler_saturation",
 			Help: "Last computed composite inference-saturation score, by namespace/scaledobject.",
 		}, []string{"namespace", "scaledobject"}),
+		SignalAge: f.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "scaler_signal_age_seconds",
+			Help: "Age of the Prometheus sample behind the last instant query, by namespace/scaledobject/dimension -- " +
+				"decision time minus the sample's own Prometheus timestamp. This is the scaling control loop's " +
+				"observed staleness: how old the reading a decision acted on already was, not how long the query took.",
+		}, []string{"namespace", "scaledobject", "dimension"}),
 		GRPCRequests: f.NewCounterVec(prometheus.CounterOpts{
 			Name: "scaler_grpc_requests_total",
 			Help: "Count of ExternalScaler gRPC requests handled, by method.",
@@ -94,6 +101,19 @@ func (m *Metrics) SetSaturation(namespace, scaledObject string, value float64) {
 		return
 	}
 	m.Saturation.WithLabelValues(namespace, scaledObject).Set(value)
+}
+
+// SetSignalAge records how old the Prometheus sample behind dimension's
+// reading (e.g. "queue" or "kv") already was at decision time, for a
+// namespace/scaledobject pair. Recorded alongside every successful instant
+// query -- i.e. alongside every scaling decision -- so staleness can be
+// plotted over time instead of reasoned about from the configured intervals
+// alone.
+func (m *Metrics) SetSignalAge(namespace, scaledObject, dimension string, age time.Duration) {
+	if m == nil {
+		return
+	}
+	m.SignalAge.WithLabelValues(namespace, scaledObject, dimension).Set(age.Seconds())
 }
 
 // IncGRPCRequest records one ExternalScaler gRPC call for method (e.g.

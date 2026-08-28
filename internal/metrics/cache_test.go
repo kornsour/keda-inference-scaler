@@ -18,11 +18,11 @@ type countingSource struct {
 	count int
 }
 
-func (c *countingSource) Instant(_ context.Context, _, _ string) (float64, error) {
+func (c *countingSource) Instant(_ context.Context, _, _ string) (Sample, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.count++
-	return float64(c.count), nil
+	return Sample{Value: float64(c.count), Time: time.Now()}, nil
 }
 
 func (c *countingSource) calls() int {
@@ -88,10 +88,10 @@ type blockingSource struct {
 	release chan struct{}
 }
 
-func (b *blockingSource) Instant(_ context.Context, _, _ string) (float64, error) {
+func (b *blockingSource) Instant(_ context.Context, _, _ string) (Sample, error) {
 	atomic.AddInt32(&b.calls, 1)
 	<-b.release
-	return 42, nil
+	return Sample{Value: 42, Time: time.Now()}, nil
 }
 
 func TestCachingSourceSingleflightCollapsesConcurrentCallers(t *testing.T) {
@@ -100,7 +100,7 @@ func TestCachingSourceSingleflightCollapsesConcurrentCallers(t *testing.T) {
 
 	const n = 5
 	var wg sync.WaitGroup
-	results := make([]float64, n)
+	results := make([]Sample, n)
 	errs := make([]error, n)
 	for i := 0; i < n; i++ {
 		wg.Add(1)
@@ -126,8 +126,8 @@ func TestCachingSourceSingleflightCollapsesConcurrentCallers(t *testing.T) {
 		if err != nil {
 			t.Fatalf("caller %d: unexpected error: %v", i, err)
 		}
-		if results[i] != 42 {
-			t.Fatalf("caller %d: got %v, want 42", i, results[i])
+		if results[i].Value != 42 {
+			t.Fatalf("caller %d: got %v, want 42", i, results[i].Value)
 		}
 	}
 }
@@ -174,11 +174,11 @@ type erroringSource struct {
 	err   error
 }
 
-func (e *erroringSource) Instant(_ context.Context, _, _ string) (float64, error) {
+func (e *erroringSource) Instant(_ context.Context, _, _ string) (Sample, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.count++
-	return 0, e.err
+	return Sample{}, e.err
 }
 
 func (e *erroringSource) calls() int {
