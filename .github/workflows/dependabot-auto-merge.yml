@@ -1,0 +1,32 @@
+name: Dependabot auto-merge
+
+# Enables GitHub's native auto-merge on Dependabot PRs, so each one merges
+# itself (squash) once the required checks on main go green. The logic lives in
+# kornsour/gh-automation; this file only wires it up.
+#
+# The merge is enabled with AUTOMERGE_TOKEN, never GITHUB_TOKEN: a merge caused
+# by GITHUB_TOKEN lands on main without starting any push-triggered workflow
+# (ci on main with its image publish, e2e). require-token makes the job fail
+# closed if the secret is missing rather than silently regress to that.
+#
+# AUTOMERGE_TOKEN is a *Dependabot* secret (Settings > Secrets and variables >
+# Dependabot) -- this workflow runs as dependabot[bot], which cannot read
+# Actions secrets. Create a fine-grained PAT with Contents, Pull requests and
+# Workflows read/write on this repo, then:
+#   gh secret set AUTOMERGE_TOKEN --app dependabot -R kornsour/keda-inference-scaler
+# See the gh-automation README for the full setup.
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  automerge:
+    uses: kornsour/gh-automation/.github/workflows/dependabot-auto-merge.yml@v1
+    with:
+      require-token: true
+    secrets:
+      AUTOMERGE_TOKEN: ${{ secrets.AUTOMERGE_TOKEN }}
