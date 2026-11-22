@@ -1,0 +1,21 @@
+name: Auto-merge
+
+# Turns on GitHub auto-merge (squash) for every non-draft, same-repository PR
+# that Dependabot did not open. GitHub still holds the PR until main's required
+# status checks pass; a red check never merges. Fork PRs are never auto-merged,
+# and Dependabot PRs stay with dependabot-auto-merge.yml.
+# See kornsour/gh-automation README, "auto-merge.yml".
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    uses: kornsour/gh-automation/.github/workflows/auto-merge.yml@e173379fefb37f9349129412a857f671525f2a05 # auto-merge.yml pinned 2026-11-22
+    secrets:
+      AUTOMERGE_TOKEN: ${{ secrets.AUTOMERGE_TOKEN }}
