@@ -4,7 +4,7 @@ name: Auto-merge
 # that Dependabot did not open. GitHub still holds the PR until main's required
 # status checks pass; a red check never merges. Fork PRs are never auto-merged,
 # and Dependabot PRs stay with dependabot-auto-merge.yml.
-# See kornsour/gh-automation README, "auto-merge.yml".
+# See lurking-walrus/gh-automation README, "auto-merge.yml".
 
 on:
   pull_request:
@@ -16,6 +16,6 @@ permissions:
 
 jobs:
   auto-merge:
-    uses: kornsour/gh-automation/.github/workflows/auto-merge.yml@e173379fefb37f9349129412a857f671525f2a05 # auto-merge.yml pinned 2026-11-22
+    uses: lurking-walrus/gh-automation/.github/workflows/auto-merge.yml@9755c5a968c76d19c7f54017d4bcd1b314810426 # main 2026-11-26
     secrets:
       AUTOMERGE_TOKEN: ${{ secrets.AUTOMERGE_TOKEN }}
