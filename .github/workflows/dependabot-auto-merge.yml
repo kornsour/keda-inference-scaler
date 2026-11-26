@@ -2,7 +2,7 @@ name: Dependabot auto-merge
 
 # Enables GitHub's native auto-merge on Dependabot PRs, so each one merges
 # itself (squash) once the required checks on main go green. The logic lives in
-# kornsour/gh-automation; this file only wires it up.
+# lurking-walrus/gh-automation; this file only wires it up.
 #
 # The merge is enabled with AUTOMERGE_TOKEN, never GITHUB_TOKEN: a merge caused
 # by GITHUB_TOKEN lands on main without starting any push-triggered workflow
@@ -25,7 +25,7 @@ permissions:
 
 jobs:
   automerge:
-    uses: kornsour/gh-automation/.github/workflows/dependabot-auto-merge.yml@v1
+    uses: lurking-walrus/gh-automation/.github/workflows/dependabot-auto-merge.yml@9755c5a968c76d19c7f54017d4bcd1b314810426 # main 2026-11-26
     with:
       require-token: true
     secrets:
